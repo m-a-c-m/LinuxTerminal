@@ -280,7 +280,7 @@ export default function LinuxTerminal({ locale }: Props) {
 
   const [fs, setFs] = useState<FsState>(createInitialFs);
   const [sessions, setSessions] = useState<Session[]>(() => [
-    { id: 1, remote: null, fs: null, cwd: [...USER_HOME], entries: bannerLines(locale === "es").map((t) => ({ kind: "out" as const, text: t })), input: "", histIdx: -1, env: { USER: "alumno", HOSTNAME: "pc-aula", HOME: "/home/alumno", SHELL: "/bin/bash" }, ended: false },
+    { id: 1, remote: null, fs: null, cwd: [...USER_HOME], entries: bannerLines(locale === "es").map((t) => ({ kind: "out" as const, text: t })), input: "", histIdx: -1, env: { ...DEFAULT_HOME_ENV }, ended: false },
   ]);
   const [activeId, setActiveId] = useState(1);
   const [unread, setUnread] = useState<Record<number, number>>({});
@@ -361,7 +361,7 @@ export default function LinuxTerminal({ locale }: Props) {
     const id = nextIdRef.current++;
     setSessions((prev) => [
       ...prev,
-      { id, remote: null, fs: null, cwd: [...USER_HOME], entries: [{ kind: "out", text: "" }, { kind: "out", text: isEs ? "Nueva terminal local. Todas las locales comparten el mismo disco." : "New local terminal. All local tabs share the same disk." }], input: "", histIdx: -1, env: { USER: "alumno", HOSTNAME: "pc-aula", HOME: "/home/alumno", SHELL: "/bin/bash" }, ended: false },
+      { id, remote: null, fs: null, cwd: [...USER_HOME], entries: [{ kind: "out", text: "" }, { kind: "out", text: isEs ? "Nueva terminal local. Todas las locales comparten el mismo disco." : "New local terminal. All local tabs share the same disk." }], input: "", histIdx: -1, env: { ...DEFAULT_HOME_ENV }, ended: false },
     ]);
     setActiveId(id);
     setUnread((prev) => ({ ...prev, [id]: 0 }));
@@ -371,7 +371,7 @@ export default function LinuxTerminal({ locale }: Props) {
     setSessions((prev) => {
       const next = prev.filter((s) => s.id !== id);
       if (next.length === 0) {
-        const fresh: Session = { id: nextIdRef.current++, remote: null, fs: null, cwd: [...USER_HOME], entries: bannerLines(isEs).map((t) => ({ kind: "out" as const, text: t })), input: "", histIdx: -1, env: { USER: "alumno", HOSTNAME: "pc-aula", HOME: "/home/alumno", SHELL: "/bin/bash" }, ended: false };
+        const fresh: Session = { id: nextIdRef.current++, remote: null, fs: null, cwd: [...USER_HOME], entries: bannerLines(isEs).map((t) => ({ kind: "out" as const, text: t })), input: "", histIdx: -1, env: { ...DEFAULT_HOME_ENV }, ended: false };
         setActiveId(fresh.id);
         return [fresh];
       }
@@ -387,7 +387,7 @@ export default function LinuxTerminal({ locale }: Props) {
 
   const resetTerminal = useCallback(() => {
     setFs(createInitialFs());
-    setSessions([{ id: nextIdRef.current++, remote: null, fs: null, cwd: [...USER_HOME], entries: bannerLines(isEs).map((t) => ({ kind: "out" as const, text: t })), input: "", histIdx: -1, env: { USER: "alumno", HOSTNAME: "pc-aula", HOME: "/home/alumno", SHELL: "/bin/bash" }, ended: false }]);
+    setSessions([{ id: nextIdRef.current++, remote: null, fs: null, cwd: [...USER_HOME], entries: bannerLines(isEs).map((t) => ({ kind: "out" as const, text: t })), input: "", histIdx: -1, env: { ...DEFAULT_HOME_ENV }, ended: false }]);
     setActiveLesson(null);
     setShowHint(false);
     setUnread({});

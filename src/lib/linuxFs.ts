@@ -6,6 +6,7 @@ export interface FsNode {
   children?: Record<string, FsNode>;
   content?: string;
   perms?: string;
+  link?: string[];
 }
 
 export interface FsState {
@@ -34,6 +35,7 @@ export const DEFAULT_PERMS = { dir: "drwxr-xr-x", file: "-rw-r--r--" };
 function cloneNode(node: FsNode): FsNode {
   const out: FsNode = { name: node.name, kind: node.kind };
   if (node.perms) out.perms = node.perms;
+  if (node.link) out.link = [...node.link];
   if (node.children) {
     out.children = {};
     for (const key of Object.keys(node.children)) {
@@ -46,6 +48,13 @@ function cloneNode(node: FsNode): FsNode {
 
 export function cloneState(state: FsState): FsState {
   return { root: cloneNode(state.root) };
+}
+
+function usrBinChildren(): Record<string, FsNode> {
+  const names = ["apt", "bash", "cat", "chmod", "cp", "curl", "date", "df", "du", "env", "find", "free", "grep", "head", "hostname", "ip", "jq", "less", "ln", "ls", "man", "mkdir", "mv", "nano", "ping", "ps", "pwd", "rm", "scp", "sort", "ssh", "stat", "tail", "tar", "touch", "tree", "uname", "uniq", "vim", "wc", "wget", "which", "who", "whoami"];
+  const out: Record<string, FsNode> = {};
+  for (const name of names) out[name] = { name, kind: "file", content: "binario simulado", perms: "-rwxr-xr-x" };
+  return out;
 }
 
 export function createInitialFs(): FsState {
@@ -63,6 +72,23 @@ export function createInitialFs(): FsState {
             name: "hosts",
             kind: "file",
             content: "127.0.0.1    localhost\n192.168.1.42 pc-aula\n",
+          },
+          "os-release": {
+            name: "os-release",
+            kind: "file",
+            content:
+              'PRETTY_NAME="Ubuntu 24.04 LTS (simulado)"\nNAME="Ubuntu"\nVERSION_ID="24.04"\nVERSION="24.04 LTS (Noble Numbat)"\nID=ubuntu\nID_LIKE=debian\nHOME_URL="https://www.ubuntu.com/"\n',
+          },
+        },
+      },
+      usr: {
+        name: "usr",
+        kind: "dir",
+        children: {
+          bin: {
+            name: "bin",
+            kind: "dir",
+            children: usrBinChildren(),
           },
         },
       },
@@ -170,7 +196,7 @@ export function displayPath(cwd: string[]): string {
   return full;
 }
 
-function findNode(node: FsNode, segments: string[]): FsNode | null {
+function findNodeRaw(node: FsNode, segments: string[]): FsNode | null {
   let current: FsNode = node;
   for (const seg of segments) {
     if (current.kind !== "dir" || !current.children) return null;
@@ -181,8 +207,27 @@ function findNode(node: FsNode, segments: string[]): FsNode | null {
   return current;
 }
 
+export function getNodeRaw(state: FsState, path: string[]): FsNode | null {
+  return findNodeRaw(state.root, path);
+}
+
 export function getNode(state: FsState, path: string[]): FsNode | null {
-  return findNode(state.root, path);
+  let current: FsNode | null = state.root;
+  let hops = 0;
+  for (const seg of path) {
+    if (!current || current.kind !== "dir" || !current.children) return null;
+    let child: FsNode | null = current.children[seg] ?? null;
+    while (child?.link && hops < 20) {
+      child = findNodeRaw(state.root, child.link);
+      hops++;
+    }
+    current = child;
+  }
+  while (current?.link && hops < 20) {
+    current = findNodeRaw(state.root, current.link);
+    hops++;
+  }
+  return current;
 }
 
 export function pathExists(state: FsState, path: string[]): boolean {
@@ -207,11 +252,11 @@ export function dirContains(state: FsState, dirPath: string[], childName: string
   return kind ? child.kind === kind : true;
 }
 
-export function listDir(state: FsState, path: string[]): FsResult<{ name: string; kind: FsKind; perms?: string }[]> {
+export function listDir(state: FsState, path: string[]): FsResult<{ name: string; kind: FsKind; perms?: string; link?: string }[]> {
   const node = getNode(state, path);
   if (!node) return { ok: false, error: "notFound" };
   if (node.kind !== "dir") return { ok: false, error: "notADir" };
-  const entries = Object.values(node.children ?? {}).map((n) => ({ name: n.name, kind: n.kind, perms: n.perms }));
+  const entries = Object.values(node.children ?? {}).map((n) => ({ name: n.name, kind: n.kind, perms: n.perms, link: n.link ? pathToString(n.link) : undefined }));
   entries.sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === "dir" ? -1 : 1));
   return { ok: true, value: entries };
 }
@@ -295,9 +340,17 @@ export function chmod(state: FsState, path: string[], perms: string): FsResult<F
   return { ok: true, value: next };
 }
 
+export function createLink(state: FsState, linkPath: string[], target: string[]): FsResult<FsState> {
+  if (linkPath.length === 0) return { ok: false, error: "rootOp" };
+  const next = cloneState(state);
+  const err = insertChild(next.root, linkPath, () => ({ name: linkPath[linkPath.length - 1], kind: "file", link: [...target], perms: "lrwxrwxrwx" }));
+  if (err) return { ok: false, error: err };
+  return { ok: true, value: next };
+}
+
 export function deletePath(state: FsState, path: string[], recursive = false): FsResult<FsState> {
   if (path.length === 0) return { ok: false, error: "rootOp" };
-  const target = getNode(state, path);
+  const target = getNodeRaw(state, path);
   if (!target) return { ok: false, error: "notFound" };
   if (target.kind === "dir" && !recursive && Object.keys(target.children ?? {}).length > 0) {
     return { ok: false, error: "dirNotEmpty" };
