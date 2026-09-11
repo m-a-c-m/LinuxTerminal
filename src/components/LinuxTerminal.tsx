@@ -42,6 +42,26 @@ interface Session {
   ended: boolean;
 }
 
+interface SavedEnv {
+  savedAt: string;
+  fs: FsState;
+  sessions: Session[];
+  activeId: number;
+  doneLessons: string[];
+  cmdHistory: string[];
+}
+
+function loadSavedEnvs(key: string): Record<string, SavedEnv> {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, SavedEnv>;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 interface LessonStep {
   es: string;
   en: string;
@@ -291,16 +311,20 @@ export default function LinuxTerminal({ locale }: Props) {
   const [cmdsRun, setCmdsRun] = useState<string[]>([]);
   const [fontSize, setFontSize] = useState<"base" | "lg" | "xl">("base");
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [layout, setLayout] = useState<"single" | "split">("single");
+  const [showEnvs, setShowEnvs] = useState(false);
+  const [envName, setEnvName] = useState("");
+  const [envMsg, setEnvMsg] = useState("");
+  const [savedEnvs, setSavedEnvs] = useState<Record<string, SavedEnv>>({});
 
   const nextIdRef = useRef(2);
   const windowRef = useRef<HTMLDivElement>(null);
-  const outputRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const outputRefs = useRef<Record<number, HTMLDivElement | null>>({});
+  const inputRefs = useRef<Record<number, HTMLInputElement | null>>({});
   const histRef = useRef<string[]>([]);
   histRef.current = cmdHistory;
 
   const active = sessions.find((s) => s.id === activeId) ?? sessions[0];
-  const activeIdx = sessions.findIndex((s) => s.id === active.id);
 
   useEffect(() => {
     try {
@@ -312,6 +336,9 @@ export default function LinuxTerminal({ locale }: Props) {
       }
       const rawFs = localStorage.getItem(`${STORAGE_KEY}-fs`);
       if (rawFs === "base" || rawFs === "lg" || rawFs === "xl") setFontSize(rawFs);
+      const rawLayout = localStorage.getItem(`${STORAGE_KEY}-layout`);
+      if (rawLayout === "split") setLayout("split");
+      setSavedEnvs(loadSavedEnvs(`${STORAGE_KEY}-envs`));
     } catch {}
   }, []);
 
@@ -323,6 +350,81 @@ export default function LinuxTerminal({ locale }: Props) {
     setFontSize(next);
     try { localStorage.setItem(`${STORAGE_KEY}-fs`, next); } catch {}
   }, []);
+
+  const changeLayout = useCallback((next: "single" | "split") => {
+    setLayout(next);
+    try { localStorage.setItem(`${STORAGE_KEY}-layout`, next); } catch {}
+  }, []);
+
+  const persistEnvs = useCallback((next: Record<string, SavedEnv>) => {
+    setSavedEnvs(next);
+    try { localStorage.setItem(`${STORAGE_KEY}-envs`, JSON.stringify(next)); } catch {}
+  }, []);
+
+  const applyEnv = useCallback((env: SavedEnv) => {
+    setFs(env.fs);
+    const restored = env.sessions.map((s) => ({ ...s, input: "", histIdx: -1 }));
+    setSessions(restored);
+    setActiveId(restored.some((s) => s.id === env.activeId) ? env.activeId : restored[0].id);
+    nextIdRef.current = Math.max(...restored.map((s) => s.id)) + 1;
+    setDoneLessons(env.doneLessons ?? []);
+    setCmdHistory(env.cmdHistory ?? []);
+    setUnread({});
+    setActiveLesson(null);
+    setShowHint(false);
+  }, []);
+
+  const snapshotEnv = useCallback((): SavedEnv => ({
+    savedAt: new Date().toISOString(),
+    fs,
+    sessions,
+    activeId,
+    doneLessons,
+    cmdHistory,
+  }), [fs, sessions, activeId, doneLessons, cmdHistory]);
+
+  const saveEnv = useCallback(() => {
+    const name = envName.trim();
+    if (!name) return;
+    persistEnvs({ ...savedEnvs, [name]: snapshotEnv() });
+    setEnvName("");
+    setEnvMsg(isEs ? `Entorno «${name}» guardado.` : `Environment «${name}» saved.`);
+  }, [envName, savedEnvs, snapshotEnv, persistEnvs, isEs]);
+
+  const deleteEnv = useCallback((name: string) => {
+    const next = { ...savedEnvs };
+    delete next[name];
+    persistEnvs(next);
+  }, [savedEnvs, persistEnvs]);
+
+  const exportEnv = useCallback(() => {
+    const name = envName.trim() || "entorno-linux";
+    const blob = new Blob([JSON.stringify(snapshotEnv(), null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${name}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [envName, snapshotEnv]);
+
+  const importEnv = useCallback((file: File) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(String(reader.result)) as SavedEnv;
+        if (!parsed || !parsed.fs || !Array.isArray(parsed.sessions) || parsed.sessions.length === 0) {
+          setEnvMsg(isEs ? "El archivo no es un entorno válido." : "The file is not a valid environment.");
+          return;
+        }
+        applyEnv(parsed);
+        setEnvMsg(isEs ? "Entorno importado." : "Environment imported.");
+      } catch {
+        setEnvMsg(isEs ? "El archivo no es un entorno válido." : "The file is not a valid environment.");
+      }
+    };
+    reader.readAsText(file);
+  }, [applyEnv, isEs]);
 
   const toggleFullscreen = useCallback(() => {
     if (!windowRef.current) return;
@@ -350,8 +452,14 @@ export default function LinuxTerminal({ locale }: Props) {
   }, []);
 
   useEffect(() => {
-    if (outputRef.current) outputRef.current.scrollTop = outputRef.current.scrollHeight;
-  }, [active?.entries]);
+    for (const el of Object.values(outputRefs.current)) {
+      if (el) el.scrollTop = el.scrollHeight;
+    }
+  }, [sessions]);
+
+  useEffect(() => {
+    inputRefs.current[activeId]?.focus();
+  }, [activeId]);
 
   const appendEntries = useCallback((id: number, entries: OutputEntry[]) => {
     patchSession(id, (s) => ({ entries: [...s.entries, ...entries] }));
@@ -393,7 +501,7 @@ export default function LinuxTerminal({ locale }: Props) {
     setUnread({});
   }, [isEs]);
 
-  const checkLessonProgress = useCallback((lesson: Lesson, st: FsState, cw: string[], cmds: string[]) => {
+  const checkLessonProgress = useCallback((lesson: Lesson, st: FsState, cw: string[], cmds: string[], id: number) => {
     let allDone = true;
     for (const step of lesson.steps) {
       if (!step.done(st, cw, cmds)) allDone = false;
@@ -405,45 +513,45 @@ export default function LinuxTerminal({ locale }: Props) {
         persist(next, histRef.current);
         return next;
       });
-      appendEntries(activeId, [{ kind: "ok", text: isEs ? `✔ Lección completada: ${lesson.titleEs}` : `✔ Lesson completed: ${lesson.titleEn}` }]);
+      appendEntries(id, [{ kind: "ok", text: isEs ? `✔ Lección completada: ${lesson.titleEs}` : `✔ Lesson completed: ${lesson.titleEn}` }]);
       setActiveLesson(null);
       setShowHint(false);
     }
-  }, [isEs, persist, appendEntries, activeId]);
+  }, [isEs, persist, appendEntries]);
 
-  const handleSubmit = useCallback(() => {
-    const line = active.input;
-    const cwd = active.cwd;
-    const env = active.env;
-    const sessionFs = active.remote && active.fs ? active.fs : fs;
-    patchSession(active.id, { input: "", histIdx: -1 });
+  const handleSubmit = useCallback((session: Session) => {
+    const line = session.input;
+    const cwd = session.cwd;
+    const env = session.env;
+    const sessionFs = session.remote && session.fs ? session.fs : fs;
+    patchSession(session.id, { input: "", histIdx: -1 });
     if (!line.trim()) {
-      appendEntries(active.id, [{ kind: "cmd", text: `${promptString(cwd, env)} ` }]);
+      appendEntries(session.id, [{ kind: "cmd", text: `${promptString(cwd, env)} ` }]);
       return;
     }
-    appendEntries(active.id, [{ kind: "cmd", text: `${promptString(cwd, env)} ${line}` }]);
+    appendEntries(session.id, [{ kind: "cmd", text: `${promptString(cwd, env)} ${line}` }]);
     const nextHistory = [line, ...cmdHistory.filter((h) => h !== line)].slice(0, 60);
     setCmdHistory(nextHistory);
     persist(doneLessons, nextHistory);
 
-    const opts: BashOptions = { isEs, env, history: cmdHistory, remote: Boolean(active.remote) };
+    const opts: BashOptions = { isEs, env, history: cmdHistory, remote: Boolean(session.remote) };
     const result = executeLine(sessionFs, cwd, line, opts);
 
     if (result.clear) {
-      patchSession(active.id, { cwd: result.cwd, env: result.env ?? env, fs: active.remote ? result.state : active.fs, entries: [] });
-      if (!active.remote) setFs(result.state);
-      if (result.exit) patchSession(active.id, { ended: true });
+      patchSession(session.id, { cwd: result.cwd, env: result.env ?? env, fs: session.remote ? result.state : session.fs, entries: [] });
+      if (!session.remote) setFs(result.state);
+      if (result.exit) patchSession(session.id, { ended: true });
       return;
     }
-    appendEntries(active.id, result.lines.map((t) => ({ kind: (result.error ? "err" : "out") as OutputEntry["kind"], text: t })));
-    patchSession(active.id, { cwd: result.cwd, env: result.env ?? env, fs: active.remote ? result.state : active.fs });
-    if (!active.remote) setFs(result.state);
+    appendEntries(session.id, result.lines.map((t) => ({ kind: (result.error ? "err" : "out") as OutputEntry["kind"], text: t })));
+    patchSession(session.id, { cwd: result.cwd, env: result.env ?? env, fs: session.remote ? result.state : session.fs });
+    if (!session.remote) setFs(result.state);
 
     if (result.exit) {
-      if (active.remote) {
-        closeSession(active.id);
+      if (session.remote) {
+        closeSession(session.id);
       } else {
-        patchSession(active.id, { ended: true });
+        patchSession(session.id, { ended: true });
       }
       return;
     }
@@ -471,7 +579,7 @@ export default function LinuxTerminal({ locale }: Props) {
 
     if (result.broadcast) {
       setSessions((prev) => prev.map((s) => {
-        if (s.id === active.id) return s;
+        if (s.id === session.id) return s;
         return { ...s, entries: [...s.entries,
           { kind: "ok", text: isEs ? `--- Mensaje general (wall) desde otra terminal ---` : `--- Broadcast (wall) from another terminal ---` },
           { kind: "out", text: result.broadcast ?? "" },
@@ -480,7 +588,7 @@ export default function LinuxTerminal({ locale }: Props) {
       setUnread((prev) => {
         const next = { ...prev };
         for (const s of sessions) {
-          if (s.id !== active.id) next[s.id] = (next[s.id] ?? 0) + 1;
+          if (s.id !== session.id) next[s.id] = (next[s.id] ?? 0) + 1;
         }
         return next;
       });
@@ -490,32 +598,32 @@ export default function LinuxTerminal({ locale }: Props) {
     const nextCmds = [...cmdsRun, lowerCmd];
     setCmdsRun(nextCmds);
     if (activeLesson) {
-      checkLessonProgress(activeLesson, result.state, result.cwd, nextCmds);
+      checkLessonProgress(activeLesson, result.state, result.cwd, nextCmds, session.id);
     }
-  }, [active, activeIdx, activeId, fs, cmdHistory, doneLessons, persist, isEs, activeLesson, cmdsRun, checkLessonProgress, patchSession, appendEntries, closeSession, sessions]);
+  }, [fs, cmdHistory, doneLessons, persist, isEs, activeLesson, cmdsRun, checkLessonProgress, patchSession, appendEntries, closeSession, sessions]);
 
-  const handleKey = useCallback((e: React.KeyboardEvent<HTMLInputElement>) => {
+  const handleKey = useCallback((e: React.KeyboardEvent<HTMLInputElement>, session: Session) => {
     if (e.key === "Enter") {
       e.preventDefault();
-      if (active.ended) return;
-      handleSubmit();
+      if (session.ended) return;
+      handleSubmit(session);
       return;
     }
     if (e.key === "ArrowUp") {
       e.preventDefault();
       if (histRef.current.length === 0) return;
-      const next = Math.min(active.histIdx + 1, histRef.current.length - 1);
-      patchSession(active.id, { histIdx: next, input: histRef.current[next] });
+      const next = Math.min(session.histIdx + 1, histRef.current.length - 1);
+      patchSession(session.id, { histIdx: next, input: histRef.current[next] });
     } else if (e.key === "ArrowDown") {
       e.preventDefault();
-      if (active.histIdx <= 0) {
-        patchSession(active.id, { histIdx: -1, input: "" });
+      if (session.histIdx <= 0) {
+        patchSession(session.id, { histIdx: -1, input: "" });
       } else {
-        patchSession(active.id, { histIdx: active.histIdx - 1, input: histRef.current[active.histIdx - 1] });
+        patchSession(session.id, { histIdx: session.histIdx - 1, input: histRef.current[session.histIdx - 1] });
       }
     } else if (e.key === "Tab") {
       e.preventDefault();
-      const input = active.input;
+      const input = session.input;
       const parts = input.split(/\s+/);
       if (parts.length === 0) return;
       const last = parts[parts.length - 1];
@@ -525,10 +633,10 @@ export default function LinuxTerminal({ locale }: Props) {
       if (parts.length === 1) {
         candidates = COMMAND_NAMES.filter((c) => c.startsWith(lower));
       } else {
-        const sessionFs = active.remote && active.fs ? active.fs : fs;
+        const sessionFs = session.remote && session.fs ? session.fs : fs;
         const pathSegs = last.split(/[\\/]+/).filter((p) => p.length > 0);
         const searchName = (pathSegs.pop() ?? "").toLowerCase();
-        const targetDir = pathSegs.length > 0 ? pathSegs : active.cwd;
+        const targetDir = pathSegs.length > 0 ? pathSegs : session.cwd;
         const dirNode = targetDir.length === 0 ? sessionFs.root : resolveDir(sessionFs, targetDir);
         candidates = Object.values(dirNode?.children ?? {})
           .filter((c) => c.name.toLowerCase().startsWith(searchName))
@@ -536,22 +644,22 @@ export default function LinuxTerminal({ locale }: Props) {
       }
       if (candidates.length === 1) {
         parts[parts.length - 1] = candidates[0];
-        patchSession(active.id, { input: parts.join(" ") });
+        patchSession(session.id, { input: parts.join(" ") });
       } else if (candidates.length > 1) {
-        appendEntries(active.id, [{ kind: "out", text: candidates.join("  ") }]);
+        appendEntries(session.id, [{ kind: "out", text: candidates.join("  ") }]);
       }
     } else if (e.key === "c" && e.ctrlKey) {
       e.preventDefault();
-      appendEntries(active.id, [
-        { kind: "cmd", text: `${promptString(active.cwd, active.env)} ${active.input}` },
+      appendEntries(session.id, [
+        { kind: "cmd", text: `${promptString(session.cwd, session.env)} ${session.input}` },
         { kind: "warn", text: "^C" },
       ]);
-      patchSession(active.id, { input: "" });
+      patchSession(session.id, { input: "" });
     } else if (e.key === "l" && e.ctrlKey) {
       e.preventDefault();
-      patchSession(active.id, { entries: [] });
+      patchSession(session.id, { entries: [] });
     }
-  }, [active, fs, handleSubmit, patchSession, appendEntries]);
+  }, [fs, handleSubmit, patchSession, appendEntries]);
 
   const resolveDir = (fsState: FsState, segs: string[]) => {
     let node = fsState.root;
@@ -575,7 +683,7 @@ export default function LinuxTerminal({ locale }: Props) {
       "",
     ];
     appendEntries(activeId, intro.map((t) => ({ kind: "out" as const, text: t })));
-    inputRef.current?.focus();
+    inputRefs.current[activeId]?.focus();
   }, [isEs, activeId, appendEntries]);
 
   const activeStepIdx = useMemo(() => {
@@ -593,6 +701,116 @@ export default function LinuxTerminal({ locale }: Props) {
   const tabLabel = (s: Session) => {
     if (s.remote) return `${s.remote.user}@${s.remote.host}`;
     return `bash · ${displayPath(s.cwd)}`;
+  };
+
+  const visibleSessions = layout === "split" && sessions.length > 1
+    ? [sessions[0], active.id === sessions[0].id ? sessions[1] : active]
+    : [active];
+  const isSplit = layout === "split" && visibleSessions.length > 1;
+  const outputHeight = isFullscreen ? "min-h-0 flex-1" : isSplit ? "h-[300px] sm:h-[360px]" : "h-[380px] sm:h-[460px]";
+
+  const renderPane = (s: Session) => {
+    const paneActive = s.id === activeId;
+    return (
+      <div
+        key={s.id}
+        onMouseDown={(e) => {
+          if (!paneActive) setActiveId(s.id);
+          const el = (e.currentTarget as HTMLElement).querySelector("input");
+          if (el && e.target !== el) {
+            e.preventDefault();
+            el.focus();
+          }
+        }}
+        className="flex min-h-0 min-w-0 flex-col"
+      >
+        <div className="flex items-center gap-2 border-b border-white/10 bg-white/5 px-3 py-2 sm:px-4">
+          {!isFullscreen && (
+            <>
+              <span className="h-3 w-3 rounded-full bg-red-500/80" />
+              <span className="h-3 w-3 rounded-full bg-yellow-500/80" />
+              <span className="h-3 w-3 rounded-full bg-green-500/80" />
+            </>
+          )}
+          <span className={`ml-2 hidden truncate font-mono text-xs sm:inline ${s.remote ? "text-purple-300/70" : "text-white/50"}`}>
+            {s.remote ? `ssh ${s.remote.user}@${s.remote.host} — bash` : `bash — ${displayPath(s.cwd)}`}
+          </span>
+          {paneActive && (
+            <div className="ml-auto flex items-center gap-1">
+              <div className="mr-1 hidden items-center gap-1 rounded-md border border-white/10 p-0.5 sm:flex">
+                {(["base", "lg", "xl"] as const).map((size) => (
+                  <button
+                    key={size}
+                    onClick={() => changeFontSize(size)}
+                    className={`rounded px-1.5 py-0.5 text-[10px] font-bold transition-colors ${
+                      fontSize === size ? "bg-white/15 text-white" : "text-white/40 hover:text-white/80"
+                    }`}
+                    title={isEs ? "Tamaño de letra (para proyectar)" : "Font size (for projecting)"}
+                  >
+                    {size === "base" ? "A" : size === "lg" ? "A+" : "A++"}
+                  </button>
+                ))}
+              </div>
+              <button
+                onClick={toggleFullscreen}
+                className="flex h-7 w-7 items-center justify-center rounded-md text-white/50 transition-colors hover:bg-white/10 hover:text-white"
+                title={isEs ? "Pantalla completa para proyectar" : "Fullscreen for projecting"}
+              >
+                {isFullscreen ? <MdFullscreenExit /> : <MdFullscreen />}
+              </button>
+              <button
+                onClick={createLocalSession}
+                className="hidden rounded-md px-2.5 py-1 font-mono text-[11px] font-bold text-white/40 transition-colors hover:text-white/80 sm:block"
+              >
+                {isEs ? "+ bash" : "+ bash"}
+              </button>
+            </div>
+          )}
+        </div>
+        <div
+          ref={(el) => { outputRefs.current[s.id] = el; }}
+          className={`overflow-y-auto px-3 py-3 font-mono leading-relaxed text-white/90 sm:px-4 ${outputHeight} ${fontCls}`}
+        >
+          {s.entries.map((entry, i) => (
+            <div
+              key={i}
+              className={`whitespace-pre-wrap break-words ${
+                entry.kind === "cmd"
+                  ? "font-semibold text-white"
+                  : entry.kind === "ok"
+                    ? "text-green-400"
+                    : entry.kind === "err"
+                      ? "text-red-400"
+                      : entry.kind === "warn"
+                        ? "text-amber-400"
+                        : entry.text.trimStart().startsWith("drwx") || entry.text.trimStart().startsWith("-rw") || entry.text.trimStart().startsWith("lrwx") || entry.text.trimStart().startsWith("total")
+                          ? "text-sky-300"
+                          : "text-white/70"
+              }`}
+            >
+              {entry.text}
+            </div>
+          ))}
+          <div className="flex items-center gap-0">
+            <span className={`shrink-0 whitespace-pre ${s.remote ? "text-purple-300" : "text-green-400"}`}>{s.ended ? "" : `${promptString(s.cwd, s.env)}`}</span>
+            {s.ended ? (
+              <span className="text-white/70">{isEs ? "Sesión cerrada. Cierra la pestaña o pulsa «Reiniciar terminal»." : "Session closed. Close the tab or press «Reset terminal»."}</span>
+            ) : (
+              <input
+                ref={(el) => { inputRefs.current[s.id] = el; }}
+                value={s.input}
+                onChange={(e) => patchSession(s.id, { input: e.target.value })}
+                onKeyDown={(e) => handleKey(e, s)}
+                spellCheck={false}
+                autoComplete="off"
+                className="w-full bg-transparent font-mono text-white outline-none [caret-color:#4ade80]"
+                aria-label={isEs ? "Comandos de la terminal Linux" : "Linux terminal commands"}
+              />
+            )}
+          </div>
+        </div>
+      </div>
+    );
   };
 
   return (
@@ -618,13 +836,99 @@ export default function LinuxTerminal({ locale }: Props) {
             {doneLessons.includes(l.id) ? "✔ " : ""}{isEs ? l.titleEs.split(" · ")[1] : l.titleEn.split(" · ")[1]}
           </button>
         ))}
-        <button
-          onClick={resetTerminal}
-          className="ml-auto rounded-lg border border-border/30 bg-surface/60 px-3 py-1.5 text-xs font-semibold text-text-muted transition-colors hover:text-text"
-        >
-          {isEs ? "Reiniciar terminal" : "Reset terminal"}
-        </button>
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          <button
+            onClick={() => changeLayout(layout === "split" ? "single" : "split")}
+            className={`rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors ${
+              layout === "split" ? "border-primary/40 bg-primary/10 text-primary" : "border-border/30 bg-surface/60 text-text-muted hover:text-text"
+            }`}
+            title={isEs ? "Ver dos terminales a la vez" : "See two terminals at once"}
+          >
+            {layout === "split" ? (isEs ? "1 panel" : "1 pane") : (isEs ? "2 paneles" : "2 panes")}
+          </button>
+          <button
+            onClick={() => setShowEnvs((v) => !v)}
+            className={`rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors ${
+              showEnvs ? "border-primary/40 bg-primary/10 text-primary" : "border-border/30 bg-surface/60 text-text-muted hover:text-text"
+            }`}
+          >
+            {isEs ? "Entornos" : "Environments"}
+          </button>
+          <button
+            onClick={resetTerminal}
+            className="rounded-lg border border-border/30 bg-surface/60 px-3 py-1.5 text-xs font-semibold text-text-muted transition-colors hover:text-text"
+          >
+            {isEs ? "Reiniciar terminal" : "Reset terminal"}
+          </button>
+        </div>
       </div>
+
+      {showEnvs && (
+        <div className="rounded-2xl border border-border/20 bg-surface/30 p-4 text-xs">
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              value={envName}
+              onChange={(e) => setEnvName(e.target.value)}
+              placeholder={isEs ? "Nombre del entorno (ej. clase-1)" : "Environment name (e.g. class-1)"}
+              className="w-48 rounded-lg border border-border/30 bg-background px-3 py-1.5 text-xs text-text outline-none focus:border-primary/50"
+            />
+            <button
+              onClick={saveEnv}
+              disabled={!envName.trim()}
+              className="rounded-lg border border-primary/40 bg-primary/10 px-3 py-1.5 font-semibold text-primary transition-colors disabled:opacity-40"
+            >
+              {isEs ? "Guardar" : "Save"}
+            </button>
+            <button
+              onClick={exportEnv}
+              className="rounded-lg border border-border/30 bg-surface/60 px-3 py-1.5 font-semibold text-text-muted transition-colors hover:text-text"
+            >
+              {isEs ? "Exportar archivo" : "Export file"}
+            </button>
+            <label className="cursor-pointer rounded-lg border border-border/30 bg-surface/60 px-3 py-1.5 font-semibold text-text-muted transition-colors hover:text-text">
+              {isEs ? "Importar archivo" : "Import file"}
+              <input
+                type="file"
+                accept="application/json,.json"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) importEnv(file);
+                  e.target.value = "";
+                }}
+              />
+            </label>
+            {envMsg && <span className="text-green-400">{envMsg}</span>}
+          </div>
+          {Object.keys(savedEnvs).length > 0 && (
+            <div className="mt-3 flex flex-wrap gap-2">
+              {Object.entries(savedEnvs).map(([name, env]) => (
+                <span key={name} className="flex items-center gap-1 rounded-lg border border-border/30 bg-surface/60 px-2 py-1">
+                  <button
+                    onClick={() => { applyEnv(env); setEnvMsg(isEs ? `Entorno «${name}» cargado.` : `Environment «${name}» loaded.`); }}
+                    className="font-semibold text-text transition-colors hover:text-primary"
+                    title={isEs ? "Cargar este entorno" : "Load this environment"}
+                  >
+                    {name}
+                  </button>
+                  <button
+                    onClick={() => deleteEnv(name)}
+                    className="rounded p-0.5 text-text-muted/60 transition-colors hover:text-red-400"
+                    title={isEs ? "Eliminar" : "Delete"}
+                  >
+                    <MdClose className="h-3 w-3" />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          <p className="mt-3 text-[11px] text-text-muted/70">
+            {isEs
+              ? "Un entorno guarda el disco virtual completo, las pestañas, el historial y las lecciones. Se almacena en tu navegador; exporta el archivo para compartirlo con la clase."
+              : "An environment saves the whole virtual disk, the tabs, the history and the lessons. It is stored in your browser; export the file to share it with the class."}
+          </p>
+        </div>
+      )}
 
       {activeLesson && nextStep && (
         <div className="rounded-2xl border border-primary/30 bg-primary/5 p-4">
@@ -651,7 +955,6 @@ export default function LinuxTerminal({ locale }: Props) {
         className={`overflow-hidden border border-white/15 bg-black ${
           isFullscreen ? "flex h-screen flex-col rounded-none" : "rounded-2xl"
         }`}
-        onClick={() => inputRef.current?.focus()}
       >
         <div className="flex items-center gap-1 overflow-x-auto border-b border-white/10 bg-black px-2 pt-2">
           {sessions.map((s, i) => (
@@ -693,97 +996,8 @@ export default function LinuxTerminal({ locale }: Props) {
             +
           </button>
         </div>
-        <div className="flex items-center gap-2 border-b border-white/10 bg-white/5 px-3 py-2 sm:px-4">
-          {!isFullscreen && (
-            <>
-              <span className="h-3 w-3 rounded-full bg-red-500/80" />
-              <span className="h-3 w-3 rounded-full bg-yellow-500/80" />
-              <span className="h-3 w-3 rounded-full bg-green-500/80" />
-              <span className={`ml-2 hidden font-mono text-xs sm:inline ${active.remote ? "text-purple-300/70" : "text-white/50"}`}>
-                {active.remote ? `ssh ${active.remote.user}@${active.remote.host} — bash` : `bash — ${displayPath(active.cwd)}`}
-              </span>
-            </>
-          )}
-          {isFullscreen && (
-            <span className={`font-mono text-xs ${active.remote ? "text-purple-300/70" : "text-white/50"}`}>
-              {active.remote ? `ssh ${active.remote.user}@${active.remote.host} — bash` : `bash — ${displayPath(active.cwd)}`}
-            </span>
-          )}
-          <div className="ml-auto flex items-center gap-1">
-            <div className="mr-1 hidden items-center gap-1 rounded-md border border-white/10 p-0.5 sm:flex">
-              {(["base", "lg", "xl"] as const).map((s) => (
-                <button
-                  key={s}
-                  onClick={(e) => { e.stopPropagation(); changeFontSize(s); }}
-                  className={`rounded px-1.5 py-0.5 text-[10px] font-bold transition-colors ${
-                    fontSize === s ? "bg-white/15 text-white" : "text-white/40 hover:text-white/80"
-                  }`}
-                  title={isEs ? "Tamaño de letra (para proyectar)" : "Font size (for projecting)"}
-                >
-                  {s === "base" ? "A" : s === "lg" ? "A+" : "A++"}
-                </button>
-              ))}
-            </div>
-            <button
-              onClick={(e) => { e.stopPropagation(); toggleFullscreen(); }}
-              className="flex h-7 w-7 items-center justify-center rounded-md text-white/50 transition-colors hover:bg-white/10 hover:text-white"
-              title={isEs ? "Pantalla completa para proyectar" : "Fullscreen for projecting"}
-            >
-              {isFullscreen ? <MdFullscreenExit /> : <MdFullscreen />}
-            </button>
-            <button
-              onClick={(e) => { e.stopPropagation(); createLocalSession(); }}
-              className="hidden rounded-md px-2.5 py-1 font-mono text-[11px] font-bold text-white/40 transition-colors hover:text-white/80 sm:block"
-            >
-              {isEs ? "+ bash" : "+ bash"}
-            </button>
-          </div>
-        </div>
-        <div
-          ref={outputRef}
-          key={active.id}
-          className={`overflow-y-auto px-3 py-3 font-mono leading-relaxed text-white/90 sm:px-4 ${
-            isFullscreen ? "min-h-0 flex-1" : "h-[380px] sm:h-[460px]"
-          } ${fontCls}`}
-        >
-          {active.entries.map((entry, i) => (
-            <div
-              key={i}
-              className={`whitespace-pre-wrap break-words ${
-                entry.kind === "cmd"
-                  ? "font-semibold text-white"
-                  : entry.kind === "ok"
-                    ? "text-green-400"
-                    : entry.kind === "err"
-                      ? "text-red-400"
-                      : entry.kind === "warn"
-                        ? "text-amber-400"
-                        : entry.text.trimStart().startsWith("drwx") || entry.text.trimStart().startsWith("-rw") || entry.text.trimStart().startsWith("total")
-                          ? "text-sky-300"
-                          : "text-white/70"
-              }`}
-            >
-              {entry.text}
-            </div>
-          ))}
-          <div className="flex items-center gap-0">
-            <span className={`shrink-0 whitespace-pre ${active.remote ? "text-purple-300" : "text-green-400"}`}>{active.ended ? "" : `${promptString(active.cwd, active.env)}`}</span>
-            {active.ended ? (
-              <span className="text-white/70">{isEs ? "Sesión cerrada. Cierra la pestaña o pulsa «Reiniciar terminal»." : "Session closed. Close the tab or press «Reset terminal»."}</span>
-            ) : (
-              <input
-                ref={inputRef}
-                value={active.input}
-                onChange={(e) => patchSession(active.id, { input: e.target.value })}
-                onKeyDown={handleKey}
-                autoFocus
-                spellCheck={false}
-                autoComplete="off"
-                className="w-full bg-transparent font-mono text-white outline-none [caret-color:#4ade80]"
-                aria-label={isEs ? "Comandos de la terminal Linux" : "Linux terminal commands"}
-              />
-            )}
-          </div>
+        <div className={`${isFullscreen ? "grid min-h-0 flex-1" : ""} ${isSplit ? "md:grid-cols-2 md:divide-x md:divide-white/10" : ""}`}>
+          {visibleSessions.map((s) => renderPane(s))}
         </div>
       </div>
 
