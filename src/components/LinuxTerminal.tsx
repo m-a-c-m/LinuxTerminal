@@ -20,6 +20,14 @@ import {
   USER_HOME,
   type FsState,
 } from "@/lib/linuxFs";
+import {
+  handleKey as rlHandleKey,
+  acceptSearch,
+  commonPrefix,
+  type ReadlineState,
+  type ReverseSearch,
+  type KeyEvent,
+} from "@/lib/readline";
 
 interface Props {
   locale?: string;
@@ -37,10 +45,79 @@ interface Session {
   cwd: string[];
   entries: OutputEntry[];
   input: string;
+  cursor: number;
   histIdx: number;
+  saved: string;
+  search: ReverseSearch | null;
+  killRing: string;
   env: Record<string, string>;
   ended: boolean;
 }
+
+const MAX_BUFFER_LINES = 2000;
+
+function trimBuffer(entries: OutputEntry[]): OutputEntry[] {
+  let total = 0;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    total += entries[i].text.split("\n").length + 1;
+    if (total > MAX_BUFFER_LINES) return entries.slice(i + 1);
+  }
+  return entries;
+}
+
+type TerminalTheme = "ubuntu" | "verde" | "contraste";
+
+interface ThemeSpec {
+  labelEs: string;
+  labelEn: string;
+  prompt: string;
+  remote: string;
+  out: string;
+  ok: string;
+  err: string;
+  warn: string;
+  listing: string;
+  caret: string;
+}
+
+const THEMES: Record<TerminalTheme, ThemeSpec> = {
+  ubuntu: {
+    labelEs: "Ubuntu",
+    labelEn: "Ubuntu",
+    prompt: "text-green-400",
+    remote: "text-purple-300",
+    out: "text-white/70",
+    ok: "text-green-400",
+    err: "text-red-400",
+    warn: "text-amber-400",
+    listing: "text-sky-300",
+    caret: "#4ade80",
+  },
+  verde: {
+    labelEs: "Verde",
+    labelEn: "Green",
+    prompt: "text-green-400",
+    remote: "text-emerald-300",
+    out: "text-green-200/80",
+    ok: "text-green-400",
+    err: "text-red-400",
+    warn: "text-yellow-400",
+    listing: "text-green-300",
+    caret: "#34d399",
+  },
+  contraste: {
+    labelEs: "Alto contraste",
+    labelEn: "High contrast",
+    prompt: "text-yellow-300",
+    remote: "text-cyan-300",
+    out: "text-white",
+    ok: "text-lime-300",
+    err: "text-red-300",
+    warn: "text-amber-300",
+    listing: "text-cyan-200",
+    caret: "#fde047",
+  },
+};
 
 interface SavedEnv {
   savedAt: string;
@@ -300,7 +377,7 @@ export default function LinuxTerminal({ locale }: Props) {
 
   const [fs, setFs] = useState<FsState>(createInitialFs);
   const [sessions, setSessions] = useState<Session[]>(() => [
-    { id: 1, remote: null, fs: null, cwd: [...USER_HOME], entries: bannerLines(locale === "es").map((t) => ({ kind: "out" as const, text: t })), input: "", histIdx: -1, env: { ...DEFAULT_HOME_ENV }, ended: false },
+    { id: 1, remote: null, fs: null, cwd: [...USER_HOME], entries: bannerLines(locale === "es").map((t) => ({ kind: "out" as const, text: t })), input: "", cursor: 0, histIdx: -1, saved: "", search: null, killRing: "", env: { ...DEFAULT_HOME_ENV }, ended: false },
   ]);
   const [activeId, setActiveId] = useState(1);
   const [unread, setUnread] = useState<Record<number, number>>({});
@@ -312,6 +389,9 @@ export default function LinuxTerminal({ locale }: Props) {
   const [fontSize, setFontSize] = useState<"base" | "lg" | "xl">("base");
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [layout, setLayout] = useState<"single" | "split">("single");
+  const [theme, setTheme] = useState<TerminalTheme>("ubuntu");
+  const [splitPct, setSplitPct] = useState(50);
+  const [isMd, setIsMd] = useState(false);
   const [showEnvs, setShowEnvs] = useState(false);
   const [envName, setEnvName] = useState("");
   const [envMsg, setEnvMsg] = useState("");
@@ -319,8 +399,10 @@ export default function LinuxTerminal({ locale }: Props) {
 
   const nextIdRef = useRef(2);
   const windowRef = useRef<HTMLDivElement>(null);
+  const splitWrapRef = useRef<HTMLDivElement>(null);
   const outputRefs = useRef<Record<number, HTMLDivElement | null>>({});
   const inputRefs = useRef<Record<number, HTMLInputElement | null>>({});
+  const lastTabRef = useRef<Record<number, string>>({});
   const histRef = useRef<string[]>([]);
   histRef.current = cmdHistory;
 
@@ -338,8 +420,20 @@ export default function LinuxTerminal({ locale }: Props) {
       if (rawFs === "base" || rawFs === "lg" || rawFs === "xl") setFontSize(rawFs);
       const rawLayout = localStorage.getItem(`${STORAGE_KEY}-layout`);
       if (rawLayout === "split") setLayout("split");
+      const rawTheme = localStorage.getItem(`${STORAGE_KEY}-theme`);
+      if (rawTheme === "ubuntu" || rawTheme === "verde" || rawTheme === "contraste") setTheme(rawTheme);
+      const rawSplit = Number(localStorage.getItem(`${STORAGE_KEY}-split`));
+      if (Number.isFinite(rawSplit) && rawSplit >= 22 && rawSplit <= 78) setSplitPct(rawSplit);
       setSavedEnvs(loadSavedEnvs(`${STORAGE_KEY}-envs`));
     } catch {}
+  }, []);
+
+  useEffect(() => {
+    const mq = window.matchMedia("(min-width: 768px)");
+    const onChange = () => setIsMd(mq.matches);
+    onChange();
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
   }, []);
 
   const persist = useCallback((nextDone: string[], nextHistory: string[]) => {
@@ -356,6 +450,33 @@ export default function LinuxTerminal({ locale }: Props) {
     try { localStorage.setItem(`${STORAGE_KEY}-layout`, next); } catch {}
   }, []);
 
+  const changeTheme = useCallback((next: TerminalTheme) => {
+    setTheme(next);
+    try { localStorage.setItem(`${STORAGE_KEY}-theme`, next); } catch {}
+  }, []);
+
+  const changeSplitPct = useCallback((pct: number) => {
+    setSplitPct(pct);
+    try { localStorage.setItem(`${STORAGE_KEY}-split`, String(pct)); } catch {}
+  }, []);
+
+  const startDrag = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const container = splitWrapRef.current;
+    if (!container) return;
+    const onMove = (ev: PointerEvent) => {
+      const rect = container.getBoundingClientRect();
+      const pct = ((ev.clientX - rect.left) / rect.width) * 100;
+      changeSplitPct(Math.round(Math.min(78, Math.max(22, pct))));
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }, [changeSplitPct]);
+
   const persistEnvs = useCallback((next: Record<string, SavedEnv>) => {
     setSavedEnvs(next);
     try { localStorage.setItem(`${STORAGE_KEY}-envs`, JSON.stringify(next)); } catch {}
@@ -363,7 +484,7 @@ export default function LinuxTerminal({ locale }: Props) {
 
   const applyEnv = useCallback((env: SavedEnv) => {
     setFs(env.fs);
-    const restored = env.sessions.map((s) => ({ ...s, input: "", histIdx: -1 }));
+    const restored = env.sessions.map((s) => ({ ...s, input: "", cursor: 0, histIdx: -1, search: null, saved: "", killRing: "" }));
     setSessions(restored);
     setActiveId(restored.some((s) => s.id === env.activeId) ? env.activeId : restored[0].id);
     nextIdRef.current = Math.max(...restored.map((s) => s.id)) + 1;
@@ -461,15 +582,23 @@ export default function LinuxTerminal({ locale }: Props) {
     inputRefs.current[activeId]?.focus();
   }, [activeId]);
 
+  useEffect(() => {
+    const el = inputRefs.current[active.id];
+    if (!el || document.activeElement !== el) return;
+    if (el.selectionStart !== active.cursor || el.selectionEnd !== active.cursor) {
+      el.setSelectionRange(active.cursor, active.cursor);
+    }
+  }, [active.input, active.cursor, active.id]);
+
   const appendEntries = useCallback((id: number, entries: OutputEntry[]) => {
-    patchSession(id, (s) => ({ entries: [...s.entries, ...entries] }));
+    patchSession(id, (s) => ({ entries: trimBuffer([...s.entries, ...entries]) }));
   }, [patchSession]);
 
   const createLocalSession = useCallback(() => {
     const id = nextIdRef.current++;
     setSessions((prev) => [
       ...prev,
-      { id, remote: null, fs: null, cwd: [...USER_HOME], entries: [{ kind: "out", text: "" }, { kind: "out", text: isEs ? "Nueva terminal local. Todas las locales comparten el mismo disco." : "New local terminal. All local tabs share the same disk." }], input: "", histIdx: -1, env: { ...DEFAULT_HOME_ENV }, ended: false },
+      { id, remote: null, fs: null, cwd: [...USER_HOME], entries: [{ kind: "out", text: "" }, { kind: "out", text: isEs ? "Nueva terminal local. Todas las locales comparten el mismo disco." : "New local terminal. All local tabs share the same disk." }], input: "", cursor: 0, histIdx: -1, saved: "", search: null, killRing: "", env: { ...DEFAULT_HOME_ENV }, ended: false },
     ]);
     setActiveId(id);
     setUnread((prev) => ({ ...prev, [id]: 0 }));
@@ -479,7 +608,7 @@ export default function LinuxTerminal({ locale }: Props) {
     setSessions((prev) => {
       const next = prev.filter((s) => s.id !== id);
       if (next.length === 0) {
-        const fresh: Session = { id: nextIdRef.current++, remote: null, fs: null, cwd: [...USER_HOME], entries: bannerLines(isEs).map((t) => ({ kind: "out" as const, text: t })), input: "", histIdx: -1, env: { ...DEFAULT_HOME_ENV }, ended: false };
+        const fresh: Session = { id: nextIdRef.current++, remote: null, fs: null, cwd: [...USER_HOME], entries: bannerLines(isEs).map((t) => ({ kind: "out" as const, text: t })), input: "", cursor: 0, histIdx: -1, saved: "", search: null, killRing: "", env: { ...DEFAULT_HOME_ENV }, ended: false };
         setActiveId(fresh.id);
         return [fresh];
       }
@@ -495,7 +624,7 @@ export default function LinuxTerminal({ locale }: Props) {
 
   const resetTerminal = useCallback(() => {
     setFs(createInitialFs());
-    setSessions([{ id: nextIdRef.current++, remote: null, fs: null, cwd: [...USER_HOME], entries: bannerLines(isEs).map((t) => ({ kind: "out" as const, text: t })), input: "", histIdx: -1, env: { ...DEFAULT_HOME_ENV }, ended: false }]);
+    setSessions([{ id: nextIdRef.current++, remote: null, fs: null, cwd: [...USER_HOME], entries: bannerLines(isEs).map((t) => ({ kind: "out" as const, text: t })), input: "", cursor: 0, histIdx: -1, saved: "", search: null, killRing: "", env: { ...DEFAULT_HOME_ENV }, ended: false }]);
     setActiveLesson(null);
     setShowHint(false);
     setUnread({});
@@ -524,7 +653,7 @@ export default function LinuxTerminal({ locale }: Props) {
     const cwd = session.cwd;
     const env = session.env;
     const sessionFs = session.remote && session.fs ? session.fs : fs;
-    patchSession(session.id, { input: "", histIdx: -1 });
+    patchSession(session.id, { input: "", cursor: 0, histIdx: -1, saved: "", search: null, killRing: "" });
     if (!line.trim()) {
       appendEntries(session.id, [{ kind: "cmd", text: `${promptString(cwd, env)} ` }]);
       return;
@@ -568,7 +697,11 @@ export default function LinuxTerminal({ locale }: Props) {
           cwd: ["home", result.openRemote!.user],
           entries: remoteBanner(isEs, result.openRemote!.host).map((t) => ({ kind: "out" as const, text: t })),
           input: "",
+          cursor: 0,
           histIdx: -1,
+          saved: "",
+          search: null,
+          killRing: "",
           env: remoteEnv,
           ended: false,
         },
@@ -602,31 +735,70 @@ export default function LinuxTerminal({ locale }: Props) {
     }
   }, [fs, cmdHistory, doneLessons, persist, isEs, activeLesson, cmdsRun, checkLessonProgress, patchSession, appendEntries, closeSession, sessions]);
 
+  const toRl = (s: Session): ReadlineState => ({
+    input: s.input,
+    cursor: s.cursor,
+    histIdx: s.histIdx,
+    saved: s.saved,
+    search: s.search,
+    killRing: s.killRing,
+    exit: false,
+  });
+
+  const patchRl = useCallback((id: number, next: ReadlineState) => {
+    patchSession(id, { input: next.input, cursor: next.cursor, histIdx: next.histIdx, saved: next.saved, search: next.search, killRing: next.killRing });
+  }, [patchSession]);
+
+  const resetInput = useCallback((id: number) => {
+    patchSession(id, { input: "", cursor: 0, histIdx: -1, saved: "", search: null, killRing: "" });
+  }, [patchSession]);
+
+  const pasteText = useCallback((session: Session, raw: string) => {
+    const text = raw.replace(/\r\n?/g, " ");
+    if (!text) return;
+    const c = session.cursor;
+    patchSession(session.id, { input: session.input.slice(0, c) + text + session.input.slice(c), cursor: c + text.length });
+  }, [patchSession]);
+
+  const pasteFromClipboard = useCallback((session: Session) => {
+    void navigator.clipboard
+      .readText()
+      .then((t) => pasteText(session, t))
+      .catch(() => {});
+  }, [pasteText]);
+
+  const exitSession = useCallback((session: Session) => {
+    appendEntries(session.id, [{ kind: "warn", text: "^D" }]);
+    if (session.remote) closeSession(session.id);
+    else patchSession(session.id, { ended: true });
+  }, [appendEntries, closeSession, patchSession]);
+
   const handleKey = useCallback((e: React.KeyboardEvent<HTMLInputElement>, session: Session) => {
+    const isAltGr = e.ctrlKey && e.altKey;
     if (e.key === "Enter") {
       e.preventDefault();
       if (session.ended) return;
-      handleSubmit(session);
+      let line = session.input;
+      if (session.search) {
+        const s2 = acceptSearch(toRl(session), histRef.current);
+        line = s2.input;
+        patchSession(session.id, { input: s2.input, cursor: s2.cursor, histIdx: s2.histIdx, saved: "", search: null });
+      }
+      if (!line.trim()) {
+        appendEntries(session.id, [{ kind: "cmd", text: `${promptString(session.cwd, session.env)} ${line}` }]);
+        resetInput(session.id);
+        return;
+      }
+      handleSubmit({ ...session, input: line, cursor: line.length });
       return;
     }
-    if (e.key === "ArrowUp") {
+    if (e.key === "Tab") {
       e.preventDefault();
-      if (histRef.current.length === 0) return;
-      const next = Math.min(session.histIdx + 1, histRef.current.length - 1);
-      patchSession(session.id, { histIdx: next, input: histRef.current[next] });
-    } else if (e.key === "ArrowDown") {
-      e.preventDefault();
-      if (session.histIdx <= 0) {
-        patchSession(session.id, { histIdx: -1, input: "" });
-      } else {
-        patchSession(session.id, { histIdx: session.histIdx - 1, input: histRef.current[session.histIdx - 1] });
-      }
-    } else if (e.key === "Tab") {
-      e.preventDefault();
+      if (session.search) return;
       const input = session.input;
       const parts = input.split(/\s+/);
       if (parts.length === 0) return;
-      const last = parts[parts.length - 1];
+      const last = parts[parts.length - 1] ?? "";
       if (last.length === 0) return;
       const lower = last.toLowerCase();
       let candidates: string[];
@@ -644,22 +816,62 @@ export default function LinuxTerminal({ locale }: Props) {
       }
       if (candidates.length === 1) {
         parts[parts.length - 1] = candidates[0];
-        patchSession(session.id, { input: parts.join(" ") });
+        const done = parts.join(" ");
+        lastTabRef.current[session.id] = done;
+        patchSession(session.id, { input: done, cursor: done.length });
       } else if (candidates.length > 1) {
-        appendEntries(session.id, [{ kind: "out", text: candidates.join("  ") }]);
+        if (lastTabRef.current[session.id] === input) {
+          appendEntries(session.id, [{ kind: "out", text: candidates.join("  ") }]);
+        } else {
+          const common = commonPrefix(candidates);
+          if (common.length > last.length) {
+            parts[parts.length - 1] = common;
+            const done = parts.join(" ");
+            lastTabRef.current[session.id] = done;
+            patchSession(session.id, { input: done, cursor: done.length });
+          } else {
+            lastTabRef.current[session.id] = input;
+          }
+        }
       }
-    } else if (e.key === "c" && e.ctrlKey) {
+      return;
+    }
+    if (e.ctrlKey && e.shiftKey && (e.key === "C" || e.key === "c")) {
+      e.preventDefault();
+      const sel = window.getSelection()?.toString();
+      if (sel) void navigator.clipboard.writeText(sel).catch(() => {});
+      return;
+    }
+    if (e.ctrlKey && e.shiftKey && (e.key === "V" || e.key === "v")) {
+      e.preventDefault();
+      pasteFromClipboard(session);
+      return;
+    }
+    if (e.ctrlKey && e.key === "c") {
       e.preventDefault();
       appendEntries(session.id, [
         { kind: "cmd", text: `${promptString(session.cwd, session.env)} ${session.input}` },
         { kind: "warn", text: "^C" },
       ]);
-      patchSession(session.id, { input: "" });
-    } else if (e.key === "l" && e.ctrlKey) {
+      resetInput(session.id);
+      return;
+    }
+    if (e.ctrlKey && e.key === "l") {
       e.preventDefault();
       patchSession(session.id, { entries: [] });
+      return;
     }
-  }, [fs, handleSubmit, patchSession, appendEntries]);
+    const plainTyping = e.key.length === 1 && (isAltGr || (!e.ctrlKey && !e.altKey));
+    if (plainTyping && !session.search) return;
+    if (e.key === " " || e.key === "Tab" || e.ctrlKey || e.altKey || session.search) e.preventDefault();
+    const ev: KeyEvent = { key: e.key, ctrl: isAltGr ? false : e.ctrlKey, alt: isAltGr ? false : e.altKey };
+    const next = rlHandleKey(toRl(session), ev, histRef.current);
+    if (next.exit) {
+      exitSession(session);
+      return;
+    }
+    patchRl(session.id, next);
+  }, [fs, handleSubmit, patchSession, appendEntries, patchRl, resetInput, pasteFromClipboard, exitSession]);
 
   const resolveDir = (fsState: FsState, segs: string[]) => {
     let node = fsState.root;
@@ -711,16 +923,12 @@ export default function LinuxTerminal({ locale }: Props) {
 
   const renderPane = (s: Session) => {
     const paneActive = s.id === activeId;
+    const th = THEMES[theme];
     return (
       <div
         key={s.id}
-        onMouseDown={(e) => {
+        onMouseDown={() => {
           if (!paneActive) setActiveId(s.id);
-          const el = (e.currentTarget as HTMLElement).querySelector("input");
-          if (el && e.target !== el) {
-            e.preventDefault();
-            el.focus();
-          }
         }}
         className="flex min-h-0 min-w-0 flex-col"
       >
@@ -769,6 +977,18 @@ export default function LinuxTerminal({ locale }: Props) {
         </div>
         <div
           ref={(el) => { outputRefs.current[s.id] = el; }}
+          onMouseUp={() => {
+            const sel = window.getSelection()?.toString();
+            if (sel) {
+              void navigator.clipboard.writeText(sel).catch(() => {});
+              return;
+            }
+            inputRefs.current[s.id]?.focus();
+          }}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            pasteFromClipboard(s);
+          }}
           className={`overflow-y-auto px-3 py-3 font-mono leading-relaxed text-white/90 sm:px-4 ${outputHeight} ${fontCls}`}
         >
           {s.entries.map((entry, i) => (
@@ -778,32 +998,41 @@ export default function LinuxTerminal({ locale }: Props) {
                 entry.kind === "cmd"
                   ? "font-semibold text-white"
                   : entry.kind === "ok"
-                    ? "text-green-400"
+                    ? th.ok
                     : entry.kind === "err"
-                      ? "text-red-400"
+                      ? th.err
                       : entry.kind === "warn"
-                        ? "text-amber-400"
+                        ? th.warn
                         : entry.text.trimStart().startsWith("drwx") || entry.text.trimStart().startsWith("-rw") || entry.text.trimStart().startsWith("lrwx") || entry.text.trimStart().startsWith("total")
-                          ? "text-sky-300"
-                          : "text-white/70"
+                          ? th.listing
+                          : th.out
               }`}
             >
               {entry.text}
             </div>
           ))}
+          {s.search && (
+            <div className="mb-1 font-mono text-xs">
+              <span className={s.search.failed ? "text-red-400" : "text-amber-300"}>
+                ({isEs ? "búsqueda inversa" : "reverse-i-search"})`{s.search.query}`:{" "}
+              </span>
+              <span className="text-white">{s.search.matchIdx >= 0 ? histRef.current[s.search.matchIdx] ?? "" : ""}</span>
+            </div>
+          )}
           <div className="flex items-center gap-0">
-            <span className={`shrink-0 whitespace-pre ${s.remote ? "text-purple-300" : "text-green-400"}`}>{s.ended ? "" : `${promptString(s.cwd, s.env)}`}</span>
+            <span className={`shrink-0 whitespace-pre ${s.remote ? th.remote : th.prompt}`}>{s.ended ? "" : `${promptString(s.cwd, s.env)}`}</span>
             {s.ended ? (
               <span className="text-white/70">{isEs ? "Sesión cerrada. Cierra la pestaña o pulsa «Reiniciar terminal»." : "Session closed. Close the tab or press «Reset terminal»."}</span>
             ) : (
               <input
                 ref={(el) => { inputRefs.current[s.id] = el; }}
                 value={s.input}
-                onChange={(e) => patchSession(s.id, { input: e.target.value })}
+                onChange={(e) => patchSession(s.id, { input: e.target.value, cursor: e.target.selectionStart ?? e.target.value.length })}
                 onKeyDown={(e) => handleKey(e, s)}
                 spellCheck={false}
                 autoComplete="off"
-                className="w-full bg-transparent font-mono text-white outline-none [caret-color:#4ade80]"
+                style={{ caretColor: th.caret }}
+                className="w-full bg-transparent font-mono text-white outline-none"
                 aria-label={isEs ? "Comandos de la terminal Linux" : "Linux terminal commands"}
               />
             )}
@@ -846,6 +1075,20 @@ export default function LinuxTerminal({ locale }: Props) {
           >
             {layout === "split" ? (isEs ? "1 panel" : "1 pane") : (isEs ? "2 paneles" : "2 panes")}
           </button>
+          <div className="flex items-center gap-1 rounded-lg border border-border/30 bg-surface/60 px-1 py-1">
+            {(Object.keys(THEMES) as TerminalTheme[]).map((t) => (
+              <button
+                key={t}
+                onClick={() => changeTheme(t)}
+                className={`rounded px-2 py-0.5 text-[11px] font-semibold transition-colors ${
+                  theme === t ? "bg-primary/20 text-primary" : "text-text-muted hover:text-text"
+                }`}
+                title={isEs ? `Tema ${THEMES[t].labelEs}` : `${THEMES[t].labelEn} theme`}
+              >
+                {t === "ubuntu" ? "Ubuntu" : t === "verde" ? "Verde" : "Contraste"}
+              </button>
+            ))}
+          </div>
           <button
             onClick={() => setShowEnvs((v) => !v)}
             className={`rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors ${
@@ -996,16 +1239,32 @@ export default function LinuxTerminal({ locale }: Props) {
             +
           </button>
         </div>
-        <div className={`${isFullscreen ? "grid min-h-0 flex-1" : ""} ${isSplit ? "md:grid-cols-2 md:divide-x md:divide-white/10" : ""}`}>
-          {visibleSessions.map((s) => renderPane(s))}
+        <div ref={splitWrapRef} className={`flex min-h-0 flex-col md:flex-row ${isFullscreen ? "flex-1" : ""}`}>
+          {isSplit ? (
+            <>
+              <div className="min-h-0 min-w-0" style={isMd ? { width: `${splitPct}%` } : undefined}>
+                {renderPane(visibleSessions[0])}
+              </div>
+              <div
+                onPointerDown={startDrag}
+                className="hidden h-2 w-full shrink-0 cursor-row-resize bg-white/10 transition-colors hover:bg-primary/60 md:h-auto md:w-2 md:cursor-col-resize"
+                aria-hidden="true"
+              />
+              <div className="min-h-0 min-w-0 flex-1">
+                {renderPane(visibleSessions[1])}
+              </div>
+            </>
+          ) : (
+            renderPane(visibleSessions[0])
+          )}
         </div>
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-text-muted/70">
         <span>
           {isEs
-            ? "↑/↓ historial · Tab completa nombres · Ctrl+L limpia · ssh abre una máquina remota en una pestaña nueva · wall avisa a todas las terminales"
-            : "↑/↓ history · Tab completes · Ctrl+L clears · ssh opens a remote machine in a tab · wall broadcasts to every terminal"}
+            ? "↑/↓ historial · Tab completa (2× lista opciones) · Ctrl+R busca en el historial · Ctrl+A/E/U/K/W estilo readline · Ctrl+L limpia · selecciona para copiar · click derecho pega · Ctrl+Mayús+C/V copiar/pegar · ssh abre máquina remota · wall avisa a todas"
+            : "↑/↓ history · Tab completes (2× lists options) · Ctrl+R searches history · Ctrl+A/E/U/K/W readline keys · Ctrl+L clears · select to copy · right-click to paste · Ctrl+Shift+C/V copy/paste · ssh opens a remote machine · wall broadcasts"}
         </span>
         {doneLessons.length > 0 && (
           <span className="font-semibold text-green-400">

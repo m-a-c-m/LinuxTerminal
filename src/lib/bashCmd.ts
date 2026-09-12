@@ -65,9 +65,44 @@ const BUILTIN_ALIASES: Record<string, string> = {
 };
 
 export function promptString(cwd: string[], env: Record<string, string> = {}): string {
+  const ps1 = env.PS1;
+  if (ps1 && ps1.trim()) return renderPs1(ps1, cwd, env);
   const user = env.USER ?? "alumno";
   const host = env.HOSTNAME ?? "pc-aula";
   return `${user}@${host}:${displayPath(cwd)}$`;
+}
+
+export function renderPs1(ps1: string, cwd: string[], env: Record<string, string>): string {
+  const user = env.USER ?? "alumno";
+  const host = env.HOSTNAME ?? "pc-aula";
+  const home = env.HOME && env.HOME.startsWith("/") ? env.HOME : `/home/${user}`;
+  const full = cwd.length === 0 ? "/" : `/${cwd.join("/")}`;
+  let w: string;
+  if (full === home) w = "~";
+  else if (full.startsWith(`${home}/`)) w = `~${full.slice(home.length)}`;
+  else w = full;
+  return ps1.replace(/\\./g, (m) => {
+    switch (m) {
+      case "\\u": return user;
+      case "\\h": return host;
+      case "\\w": return w;
+      case "\\W": {
+        if (w === "~") return "~";
+        const base = w.split("/").pop() ?? "";
+        return base.length > 0 ? base : "/";
+      }
+      case "\\$": return user === "root" ? "#" : "$";
+      case "\\\\": return "\\";
+      default: return m;
+    }
+  });
+}
+
+function stripQuotes(value: string): string {
+  if (value.length >= 2 && ((value[0] === "'" && value[value.length - 1] === "'") || (value[0] === '"' && value[value.length - 1] === '"'))) {
+    return value.slice(1, -1);
+  }
+  return value;
 }
 
 const HOSTS: Record<string, string> = {
@@ -1115,7 +1150,7 @@ export function executeLine(state: FsState, cwd: string[], rawLine: string, opts
         return { lines: [isEs ? "uso: export VARIABLE=valor" : "usage: export VARIABLE=value"], state, cwd, clear: false, exit: false, error: true };
       }
       const name = joined.slice(0, eq).trim();
-      const value = expandVars(joined.slice(eq + 1).trim(), env);
+      const value = stripQuotes(expandVars(joined.slice(eq + 1).trim(), env));
       env[name] = value;
       return { lines: [], state, cwd, clear: false, exit: false, env };
     }
