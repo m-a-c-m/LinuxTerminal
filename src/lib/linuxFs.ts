@@ -7,6 +7,8 @@ export interface FsNode {
   content?: string;
   perms?: string;
   link?: string[];
+  owner?: string;
+  group?: string;
 }
 
 export interface FsState {
@@ -32,10 +34,53 @@ export const USER_HOME = ["home", "alumno"];
 
 export const DEFAULT_PERMS = { dir: "drwxr-xr-x", file: "-rw-r--r--" };
 
+export interface PermCtx {
+  user: string;
+  group?: string;
+  umask?: string;
+  asRoot?: boolean;
+}
+
+function octalToRwx(digits: string): string {
+  const rwx = ["r", "w", "x"];
+  let out = "";
+  for (const d of digits) {
+    const bits = Number(d);
+    out += rwx.map((c, i) => (bits & (4 >> i) ? c : "-")).join("");
+  }
+  return out;
+}
+
+export function permsFor(kind: FsKind, umask?: string): string {
+  const base = kind === "dir" ? "777" : "666";
+  const raw = umask ?? "";
+  const mask = /^[0-7]{3}$/.test(raw) ? raw : /^[0-7]{4}$/.test(raw) ? raw.slice(1) : "022";
+  let oct = "";
+  for (let i = 0; i < 3; i++) oct += String((Number(base[i]) & ~Number(mask[i])) & 7);
+  return (kind === "dir" ? "d" : "-") + octalToRwx(oct);
+}
+
+export function canPerm(node: FsNode, ctx: PermCtx | undefined, want: "r" | "w" | "x"): boolean {
+  if (!ctx || ctx.asRoot || ctx.user === "root") return true;
+  const perms = node.perms ?? DEFAULT_PERMS[node.kind];
+  const body = perms.slice(1);
+  const owner = body.slice(0, 3);
+  const group = body.slice(3, 6);
+  const other = body.slice(6, 9);
+  const set = node.owner && node.owner === ctx.user
+    ? owner
+    : node.group && ctx.group && node.group === ctx.group
+      ? group
+      : other;
+  return set.includes(want);
+}
+
 function cloneNode(node: FsNode): FsNode {
   const out: FsNode = { name: node.name, kind: node.kind };
   if (node.perms) out.perms = node.perms;
   if (node.link) out.link = [...node.link];
+  if (node.owner) out.owner = node.owner;
+  if (node.group) out.group = node.group;
   if (node.children) {
     out.children = {};
     for (const key of Object.keys(node.children)) {
@@ -66,18 +111,43 @@ export function createInitialFs(): FsState {
       etc: {
         name: "etc",
         kind: "dir",
+        perms: "drwxr-xr-x",
+        owner: "root",
+        group: "root",
         children: {
-          hostname: { name: "hostname", kind: "file", content: "pc-aula\n" },
+          hostname: { name: "hostname", kind: "file", content: "pc-aula\n", owner: "root" },
           hosts: {
             name: "hosts",
             kind: "file",
             content: "127.0.0.1    localhost\n192.168.1.42 pc-aula\n",
+            owner: "root",
+          },
+          passwd: {
+            name: "passwd",
+            kind: "file",
+            content: "root:x:0:0:root:/root:/bin/bash\nalumno:x:1000:1000:Alumno Aula:/home/alumno:/bin/bash\n",
+            owner: "root",
+          },
+          group: {
+            name: "group",
+            kind: "file",
+            content: "root:x:0:\nalumno:x:1000:\nsudo:x:27:alumno\n",
+            owner: "root",
+          },
+          sudoers: {
+            name: "sudoers",
+            kind: "file",
+            content: "Defaults env_reset\nroot ALL=(ALL:ALL) ALL\n%sudo ALL=(ALL:ALL) ALL\nalumno ALL=(ALL:ALL) ALL\n",
+            perms: "-r--r-----",
+            owner: "root",
+            group: "root",
           },
           "os-release": {
             name: "os-release",
             kind: "file",
             content:
               'PRETTY_NAME="Ubuntu 24.04 LTS (simulado)"\nNAME="Ubuntu"\nVERSION_ID="24.04"\nVERSION="24.04 LTS (Noble Numbat)"\nID=ubuntu\nID_LIKE=debian\nHOME_URL="https://www.ubuntu.com/"\n',
+            owner: "root",
           },
         },
       },
@@ -95,44 +165,65 @@ export function createInitialFs(): FsState {
       home: {
         name: "home",
         kind: "dir",
+        perms: "drwxr-xr-x",
+        owner: "root",
         children: {
           alumno: {
             name: "alumno",
             kind: "dir",
+            owner: "alumno",
+            group: "alumno",
             children: {
               Documentos: {
                 name: "Documentos",
                 kind: "dir",
+                owner: "alumno",
+                group: "alumno",
                 children: {
                   "apuntes.txt": {
                     name: "apuntes.txt",
                     kind: "file",
+                    owner: "alumno",
+                    group: "alumno",
                     content: "Comandos basicos de bash:\n  ls, cd, mkdir, cat, echo, rm, cp, grep\nPractica todos los dias.",
                   },
                   "tareas.txt": {
                     name: "tareas.txt",
                     kind: "file",
+                    owner: "alumno",
+                    group: "alumno",
                     content: "1. Navegar con cd y ls\n2. Crear carpetas con mkdir\n3. Leer archivos con cat",
                   },
                   "notas.md": {
                     name: "notas.md",
                     kind: "file",
+                    owner: "alumno",
+                    group: "alumno",
                     content: "# Notas\n\n- ls -la lista con detalles\n- grep busca texto\n- | encadena comandos\n",
                   },
                 },
               },
-              Descargas: { name: "Descargas", kind: "dir", children: {} },
-              Proyectos: { name: "Proyectos", kind: "dir", children: {} },
+              Descargas: { name: "Descargas", kind: "dir", owner: "alumno", group: "alumno", children: {} },
+              Proyectos: { name: "Proyectos", kind: "dir", owner: "alumno", group: "alumno", children: {} },
               ".bashrc": {
                 name: ".bashrc",
                 kind: "file",
+                owner: "alumno",
+                group: "alumno",
                 content: "# entorno simulado\nexport PS1='\\u@\\h:\\w$ '\n",
               },
             },
           },
         },
       },
-      tmp: { name: "tmp", kind: "dir", children: {} },
+      tmp: { name: "tmp", kind: "dir", perms: "drwxrwxrwt", owner: "root", children: {} },
+      root: {
+        name: "root",
+        kind: "dir",
+        perms: "drwx------",
+        owner: "root",
+        children: {},
+      },
       var: {
         name: "var",
         kind: "dir",
@@ -279,15 +370,15 @@ function insertChild(node: FsNode, segments: string[], build: () => FsNode): FsE
   return null;
 }
 
-export function mkdir(state: FsState, path: string[]): FsResult<FsState> {
+export function mkdir(state: FsState, path: string[], ctx?: PermCtx): FsResult<FsState> {
   if (path.length === 0) return { ok: false, error: "rootOp" };
   const next = cloneState(state);
-  const err = insertChild(next.root, path, () => ({ name: path[path.length - 1], kind: "dir", children: {} }));
+  const err = insertChild(next.root, path, () => ({ name: path[path.length - 1], kind: "dir", children: {}, perms: permsFor("dir", ctx?.umask), owner: ctx?.user, group: ctx?.group ?? ctx?.user }));
   if (err) return { ok: false, error: err };
   return { ok: true, value: next };
 }
 
-export function mkdirP(state: FsState, path: string[]): FsResult<FsState> {
+export function mkdirP(state: FsState, path: string[], ctx?: PermCtx): FsResult<FsState> {
   if (path.length === 0) return { ok: false, error: "rootOp" };
   let st = state;
   for (let i = 1; i <= path.length; i++) {
@@ -297,14 +388,14 @@ export function mkdirP(state: FsState, path: string[]): FsResult<FsState> {
       if (node.kind !== "dir") return { ok: false, error: "notADir" };
       continue;
     }
-    const res = mkdir(st, partial);
+    const res = mkdir(st, partial, ctx);
     if (!res.ok) return res;
     st = res.value;
   }
   return { ok: true, value: st };
 }
 
-export function writeFile(state: FsState, path: string[], content: string, append = false): FsResult<FsState> {
+export function writeFile(state: FsState, path: string[], content: string, append = false, ctx?: PermCtx): FsResult<FsState> {
   if (path.length === 0) return { ok: false, error: "rootOp" };
   const parent = getNode(state, path.slice(0, -1));
   if (!parent || parent.kind !== "dir") return { ok: false, error: "notFound" };
@@ -320,6 +411,9 @@ export function writeFile(state: FsState, path: string[], content: string, appen
     name: leafName,
     kind: "file",
     content: append && existing ? prevContent + content : content,
+    perms: existing?.perms ?? permsFor("file", ctx?.umask),
+    owner: existing?.owner ?? ctx?.user,
+    group: existing?.group ?? ctx?.group ?? ctx?.user,
   };
   return { ok: true, value: next };
 }

@@ -18,11 +18,17 @@ import {
   countTree,
   renderTree,
   matchWildcard,
+  canPerm,
+  permsFor,
+  cloneState,
   USER_HOME,
   DEFAULT_PERMS,
   type FsNode,
   type FsState,
+  type PermCtx,
+  type FsResult,
 } from "./linuxFs";
+import { runScript, scriptTestEval, evalArithmetic, type ScriptResume, type ScriptPending } from "./bashScript";
 
 export interface BashOptions {
   isEs: boolean;
@@ -30,6 +36,8 @@ export interface BashOptions {
   history?: string[];
   remote?: boolean;
   piped?: boolean;
+  asRoot?: boolean;
+  pending?: { line: number; variable: string; value: string; source: string };
 }
 
 export interface BashResult {
@@ -39,9 +47,11 @@ export interface BashResult {
   clear: boolean;
   exit: boolean;
   error?: boolean;
+  errFrom?: number;
   env?: Record<string, string>;
   broadcast?: string;
   openRemote?: { user: string; host: string };
+  pending?: ScriptPending;
 }
 
 export const HOME = [...USER_HOME];
@@ -69,7 +79,7 @@ export function promptString(cwd: string[], env: Record<string, string> = {}): s
   if (ps1 && ps1.trim()) return renderPs1(ps1, cwd, env);
   const user = env.USER ?? "alumno";
   const host = env.HOSTNAME ?? "pc-aula";
-  return `${user}@${host}:${displayPath(cwd)}$`;
+  return `${user}@${host}:${displayPath(cwd)}${user === "root" ? "#" : "$"}`;
 }
 
 export function renderPs1(ps1: string, cwd: string[], env: Record<string, string>): string {
@@ -241,6 +251,13 @@ const MAN_PAGES: Record<string, { synopsis: string; descEs: string; descEn: stri
   tail: { synopsis: "tail [-n N] ARCHIVO", descEs: "Muestra las últimas N líneas (10 por defecto).", descEn: "Show the last N lines (10 by default)." },
   wc: { synopsis: "wc [-l] ARCHIVO", descEs: "Cuenta líneas, palabras y caracteres. -l solo líneas.", descEn: "Count lines, words and characters. -l only lines." },
   tree: { synopsis: "tree [ruta]", descEs: "Dibuja el árbol de carpetas y archivos.", descEn: "Draw the folder and file tree." },
+  sed: { synopsis: "sed 's/antiguo/nuevo/[g]' ARCHIVO", descEs: "Sustituye texto línea a línea. Con g sustituye todas las apariciones de cada línea; sin g, solo la primera.", descEn: "Substitutes text line by line. With g it replaces every occurrence per line; without g, only the first." },
+  awk: { synopsis: "awk '{print $1}' ARCHIVO", descEs: "Procesa texto campo a campo: $1 es la primera columna, $NF la última, NR el número de línea. Con -F: cambia el separador.", descEn: "Processes text field by field: $1 is the first column, $NF the last, NR the line number. Use -F: to change the separator." },
+  cut: { synopsis: "cut -d: -f1 ARCHIVO", descEs: "Corta columnas delimitadas por un separador: -d el delimitador y -f los campos a mostrar.", descEn: "Cuts delimiter-separated columns: -d sets the delimiter and -f the fields to show." },
+  tr: { synopsis: "tr CONJUNTO1 CONJUNTO2", descEs: "Traduce caracteres leídos de una tubería: cat texto | tr 'a-z' 'A-Z' lo pasa a mayúsculas. Con -d borra caracteres.", descEn: "Translates characters read from a pipe: cat text | tr 'a-z' 'A-Z' uppercases it. With -d it deletes characters." },
+  tee: { synopsis: "comando | tee ARCHIVO", descEs: "Muestra la salida por pantalla y a la vez la guarda en un archivo. Con -a añade al final en vez de sobrescribir.", descEn: "Shows output on screen and saves it to a file at the same time. With -a it appends instead of overwriting." },
+  xargs: { synopsis: "comando | xargs comando2", descEs: "Convierte la salida de un comando en argumentos del siguiente: find . -name '*.txt' | xargs rm los borra todos.", descEn: "Turns one command's output into arguments for the next: find . -name '*.txt' | xargs rm deletes them all." },
+  diff: { synopsis: "diff ARCHIVO1 ARCHIVO2", descEs: "Compara dos archivos línea a línea y muestra las diferencias con < (primer archivo) y > (segundo).", descEn: "Compares two files line by line and shows the differences with < (first file) and > (second)." },
 };
 
 function timestamp(): string {
@@ -276,20 +293,105 @@ function err(state: FsState, cwd: string[], _lines: string[], isEs: boolean, cod
   return { lines: [`bash: ${isEs ? msgEs : msgEn}`], state, cwd, clear: false, exit: false, error: true };
 }
 
+interface Token {
+  text: string;
+  quoted: boolean;
+}
+
+function tokenizeQ(line: string): Token[] {
+  const out: Token[] = [];
+  let cur = "";
+  let quoted = false;
+  let quote = "";
+  let started = false;
+  for (const c of line.trim()) {
+
+    if (quote.length > 0) {
+      if (c === quote) quote = "";
+      else cur += c;
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      quote = c;
+      quoted = true;
+      started = true;
+      continue;
+    }
+    if (/\s/.test(c)) {
+      if (started || cur.length > 0) {
+        out.push({ text: cur, quoted });
+        cur = "";
+        quoted = false;
+        started = false;
+      }
+      continue;
+    }
+    cur += c;
+    started = true;
+  }
+  if (started || cur.length > 0) out.push({ text: cur, quoted });
+  return out;
+}
+
 function tokenize(line: string): string[] {
-  return line.trim().split(/\s+/).filter((t) => t.length > 0);
+  return tokenizeQ(line).map((t) => t.text);
 }
 
 function expandVars(text: string, env: Record<string, string>): string {
-  return text
-    .replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, name: string) => {
-      const key = Object.keys(env).find((k) => k === name);
-      return key ? env[key] : "";
-    })
-    .replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (_m, name: string) => {
-      const key = Object.keys(env).find((k) => k === name);
-      return key ? env[key] : "";
-    });
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    const c = text[i];
+    if (c === "'") {
+      const close = text.indexOf("'", i + 1);
+      if (close === -1) {
+        out += text.slice(i);
+        break;
+      }
+      out += text.slice(i, close + 1);
+      i = close + 1;
+      continue;
+    }
+    if (c === '"') {
+      const close = text.indexOf('"', i + 1);
+      const seg = close === -1 ? text.slice(i) : text.slice(i, close + 1);
+      out += seg
+        .replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, name: string) => env[name] ?? "")
+        .replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (_m, name: string) => env[name] ?? "");
+      i += seg.length;
+      continue;
+    }
+    if (text.startsWith("$$((", i) || text.startsWith("$(( ", i) || (c === "$" && text[i + 1] === "(" && text[i + 2] === "(")) {
+      const closeIdx = text.indexOf("))", i + 3);
+      if (closeIdx !== -1) {
+        const inner = text.slice(i + 3, closeIdx);
+        const expanded = inner
+          .replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m2, n2: string) => env[n2] ?? "")
+          .replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (_m2, n2: string) => env[n2] ?? "");
+        const val = evalArithmetic(expanded, env);
+        if (val !== null) {
+          out += String(val);
+          i = closeIdx + 2;
+          continue;
+        }
+      }
+    }
+    if (c === "\\" && text[i + 1] === "$") {
+      out += "$";
+      i += 2;
+      continue;
+    }
+    const rest = text.slice(i);
+    const m = rest.match(/^\$\{([A-Za-z_][A-Za-z0-9_]*)\}/) ?? rest.match(/^\$([A-Za-z_][A-Za-z0-9_]*)/);
+    if (m) {
+      out += env[m[1]] ?? "";
+      i += m[0].length;
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
 }
 
 function permString(mode: string): string | null {
@@ -343,7 +445,7 @@ function applySymbolic(current: string, spec: string): string | null {
   return chars.join("");
 }
 
-function lsLines(state: FsState, cwd: string[], args: string[], isEs: boolean, piped: boolean): BashResult {
+function lsLines(state: FsState, cwd: string[], args: string[], isEs: boolean, piped: boolean, ctx?: PermCtx): BashResult {
   const flags: string[] = [];
   const paths: string[] = [];
   for (const a of args) {
@@ -360,6 +462,9 @@ function lsLines(state: FsState, cwd: string[], args: string[], isEs: boolean, p
   }
   if (node.kind !== "dir") {
     return { lines: [paths[0]], state, cwd, clear: false, exit: false };
+  }
+  if (ctx && !canPerm(node, ctx, "r")) {
+    return { lines: [`ls: no se puede abrir el directorio '${paths[0]}': ${isEs ? "Permiso denegado" : "Permission denied"}`], state, cwd, clear: false, exit: false, error: true };
   }
   const renderDir = (dirPath: string[]): string[] => {
     const res = listDir(state, dirPath);
@@ -412,7 +517,523 @@ function contentLines(content: string): string[] {
 function parsePipeline(mainLine: string): Pipeline | null {
   const parts = mainLine.split("|").map((p) => p.trim()).filter((p) => p.length > 0);
   if (parts.length < 2) return null;
-  return { segments: parts.map((p) => p.split(/\s+/).filter((t) => t.length > 0)) };
+  return { segments: parts.map((p) => tokenizeQ(p).map((t) => t.text)) };
+}
+
+interface ChainSeg {
+  op: "start" | "&&" | "||" | ";";
+  line: string;
+}
+
+function parseChain(rawLine: string): ChainSeg[] | null {
+  const segs: ChainSeg[] = [];
+  let cur = "";
+  let op: ChainSeg["op"] = "start";
+  let quote = "";
+  for (let i = 0; i < rawLine.length; i++) {
+    const c = rawLine[i];
+    if (quote.length > 0) {
+      cur += c;
+      if (c === quote) quote = "";
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      quote = c;
+      cur += c;
+      continue;
+    }
+    if (c === "&" && rawLine[i + 1] === "&") {
+      segs.push({ op, line: cur.trim() });
+      op = "&&";
+      cur = "";
+      i++;
+      continue;
+    }
+    if (c === "|" && rawLine[i + 1] === "|") {
+      segs.push({ op, line: cur.trim() });
+      op = "||";
+      cur = "";
+      i++;
+      continue;
+    }
+    if (c === ";") {
+      segs.push({ op, line: cur.trim() });
+      op = ";";
+      cur = "";
+      continue;
+    }
+    cur += c;
+  }
+  segs.push({ op, line: cur.trim() });
+  if (segs.length < 2) return null;
+  for (let i = 0; i < segs.length - 1; i++) {
+    if (segs[i].line.length === 0) return segs;
+  }
+  return segs;
+}
+
+function globMatch(name: string, pattern: string): boolean {
+  let re = "";
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === "*") re += "[^.]*";
+    else if (c === "?") re += "[^.]";
+    else if (c === "[") {
+      const close = pattern.indexOf("]", i + 1);
+      if (close === -1) {
+        re += "\\[";
+        continue;
+      }
+      let body = pattern.slice(i + 1, close);
+      let negated = false;
+      if (body[0] === "!" || body[0] === "^") {
+        negated = true;
+        body = body.slice(1);
+      }
+      re += `[${negated ? "^" : ""}${body.replace(/\\/g, "\\\\")}]`;
+      i = close;
+    } else {
+      re += c.replace(/[.+^$(){}|\\]/g, "\\$&");
+    }
+  }
+  try {
+    return new RegExp(`^${re}$`).test(name);
+  } catch {
+    return false;
+  }
+}
+
+function globExpand(state: FsState, cwd: string[], tokens: string[]): string[][] {
+  return tokens.map((t) => {
+    if (!/[*?[]/.test(t)) return [t];
+    const segs = t.split("/");
+    const pattern = segs.pop() ?? "";
+    let dirPath = cwd;
+    if (segs.length > 0) {
+      const dirRaw = segs.join("/");
+      dirPath = resolvePath(cwd, dirRaw).value;
+    }
+    const node = getNode(state, dirPath);
+    if (!node || node.kind !== "dir") return [t];
+    const matches = Object.values(node.children ?? {})
+      .filter((c) => !(pattern[0] !== "." && c.name.startsWith(".")))
+      .filter((c) => globMatch(c.name, pattern))
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((c) => (segs.length > 0 ? `${segs.join("/")}/${c.name}` : c.name) + (c.kind === "dir" ? "/" : ""));
+    return matches.length > 0 ? matches : [t];
+  });
+}
+
+function mergeTokens(qtokens: Token[], globbed: string[][]): string[] {
+  const out: string[] = [];
+  let gi = 0;
+  for (const t of qtokens) {
+    if (t.quoted) out.push(t.text);
+    else out.push(...(globbed[gi++] ?? [t.text]));
+  }
+  return out;
+}
+
+function readTextFile(state: FsState, cwd: string[], raw: string, cmdName: string, isEs: boolean, ctx?: PermCtx): { value?: string; error?: string } {
+  const path = resolvePath(cwd, raw).value;
+  const node = getNode(state, path);
+  if (!node || node.kind !== "file") {
+    return { error: `${cmdName}: ${raw}: ${isEs ? "No existe el archivo o el directorio" : "No such file or directory"}` };
+  }
+  if (!canPerm(node, ctx, "r")) {
+    return { error: `${cmdName}: ${raw}: ${isEs ? "Permiso denegado" : "Permission denied"}` };
+  }
+  return { value: node.content ?? "" };
+}
+
+function ctxFromOpts(opts: BashOptions): PermCtx {
+  const env = opts.env ?? {};
+  const user = opts.asRoot ? "root" : env.USER ?? "alumno";
+  return { user, group: env.GROUP ?? user, umask: env.UMASK, asRoot: opts.asRoot === true };
+}
+
+function traverseDenied(state: FsState, cwd: string[], rawPath: string, ctx: PermCtx, isEs: boolean): string | null {
+  if (ctx.asRoot || ctx.user === "root") return null;
+  const path = resolvePath(cwd, rawPath).value;
+  for (let i = 0; i < path.length; i++) {
+    const parent = getNode(state, path.slice(0, i));
+    if (!parent || parent.kind !== "dir") continue;
+    if (!canPerm(parent, ctx, "x")) {
+      return `${pathToString(path.slice(0, i))}: ${isEs ? "Permiso denegado" : "Permission denied"}`;
+    }
+  }
+  return null;
+}
+
+function permDenied(state: FsState, cwd: string[], rawPath: string, ctx: PermCtx, want: "r" | "w" | "x", label: string, isEs: boolean): string | null {
+  const node = getNode(state, resolvePath(cwd, rawPath).value);
+  if (!node) return null;
+  if (!canPerm(node, ctx, want)) {
+    return want === "r" && node.kind === "dir"
+      ? `bash: ${label}: no se puede abrir el directorio '${rawPath}': ${isEs ? "Permiso denegado" : "Permission denied"}`
+      : `${label}: ${rawPath}: ${isEs ? "Permiso denegado" : "Permission denied"}`;
+  }
+  const trav = traverseDenied(state, cwd, rawPath, ctx, isEs);
+  return trav ? `bash: ${label}: ${rawPath}: ${trav}` : null;
+}
+
+function parentWriteDenied(state: FsState, cwd: string[], rawPath: string, ctx: PermCtx, verb: string, isEs: boolean): string | null {
+  const path = resolvePath(cwd, rawPath).value;
+  const parent = getNode(state, path.slice(0, -1));
+  if (!parent) return null;
+  const wOk = canPerm(parent, ctx, "w");
+  const xOk = traverseDenied(state, cwd, rawPath, ctx, isEs) === null;
+  if (wOk && (xOk || ctx.asRoot || ctx.user === "root")) return null;
+  return `${verb}: no se puede ${verb === "rm" ? "borrar" : verb === "mkdir" ? "crear" : "procesar"} '${rawPath}': ${isEs ? "Permiso denegado" : "Permission denied"}`;
+}
+
+
+function chownTree(state: FsState, path: string[], owner: string | null, group: string | null, recursive: boolean): FsResult<FsState> {
+  const next = cloneState(state);
+  const node = getNode(next, path);
+  if (!node) return { ok: false, error: "notFound" };
+  const walk = (n: FsNode): void => {
+    if (owner !== null) n.owner = owner;
+    if (group !== null) n.group = group;
+    if (recursive && n.children) {
+      for (const c of Object.values(n.children)) walk(c);
+    }
+  };
+  walk(node);
+  return { ok: true, value: next };
+}
+
+function substituteCmds(rawLine: string, state: FsState, cwd: string[], opts: BashOptions): { line: string; error?: string } {
+  let out = "";
+  let i = 0;
+  let guard = 0;
+  let line = rawLine;
+  while (i < line.length) {
+    const c = line[i];
+    if (c === "'") {
+      const close = line.indexOf("'", i + 1);
+      if (close === -1) {
+        out += line.slice(i);
+        break;
+      }
+      out += line.slice(i, close + 1);
+      i = close + 1;
+      continue;
+    }
+    if (c === "$" && line[i + 1] === "(" && !(line[i + 2] === "(")) {
+      let depth = 1;
+      let j = i + 2;
+      while (j < line.length && depth > 0) {
+        if (line[j] === "(") depth++;
+        else if (line[j] === ")") depth--;
+        j++;
+      }
+      if (depth !== 0) return { line, error: isEsMsg(opts, "bash: error de sintaxis: se esperaba `)`" , "bash: syntax error: unexpected end of file") };
+      const inner = line.slice(i + 2, j - 1);
+      const res = executeLine(state, cwd, inner, { ...opts, piped: false });
+      guard++;
+      if (guard > 20) return { line, error: isEsMsg(opts, "bash: demasiadas sustituciones", "bash: too many substitutions") };
+      out += res.lines.join(" ");
+      i = j;
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return { line: out };
+}
+
+function isEsMsg(opts: BashOptions, es: string, en: string): string {
+  return opts.isEs ? es : en;
+}
+
+function sedEval(state: FsState, cwd: string[], input: string[], args: string[], isEs: boolean, ctx?: PermCtx): { lines: string[]; error?: string } {
+  const script = stripQuotes(args[0] ?? "");
+  const files = args.slice(1);
+  const match = script.match(/^(?:(\d+))?s(.)([\s\S]*)$/);
+  if (!match || match[2].length === 0) {
+    return { lines: [], error: `sed: ${isEs ? "solo se admite s/antiguo/nuevo/[g] y Nd" : "only s/old/new/[g] and Nd are supported"}` };
+  }
+  const addr = match[1] !== undefined ? Number(match[1]) : null;
+  const delim = match[2];
+  const rest = match[3];
+  const closeIdx = rest.indexOf(delim);
+  if (closeIdx === -1) return { lines: [], error: `sed: ${isEs ? "patrón sin cerrar" : "unterminated pattern"}` };
+  const oldText = rest.slice(0, closeIdx);
+  const rest2 = rest.slice(closeIdx + 1);
+  const close2 = rest2.indexOf(delim);
+  let newText = "";
+  let flagStr = "";
+  if (rest2.length === 0) {
+    newText = "";
+  } else if (close2 === -1) {
+    return { lines: [], error: `sed: ${isEs ? "sustitución sin cerrar" : "unterminated replacement"}` };
+  } else {
+    newText = rest2.slice(0, close2);
+    flagStr = rest2.slice(close2 + 1);
+  }
+  const globalF = flagStr.includes("g");
+  const ignoreF = flagStr.includes("i");
+  const re = new RegExp(oldText.replace(/[.*+?^=!:${}()|[\]\\]/g, "\\$&"), ignoreF ? "gi" : globalF ? "g" : "");
+  let source: string[] | null = null;
+  if (files.length > 0) {
+    source = [];
+    for (const f of files) {
+      const res = readTextFile(state, cwd, f, "sed", isEs, ctx);
+      if (res.error) return { lines: [], error: res.error };
+      source.push(...contentLines(res.value ?? ""));
+    }
+  }
+  const rows = source ?? input;
+  const out: string[] = [];
+  rows.forEach((l, idx) => {
+    if (addr !== null && idx + 1 !== addr) {
+      out.push(l);
+      return;
+    }
+    out.push(l.replace(re, newText));
+  });
+  return { lines: out };
+}
+
+function sedDelete(state: FsState, cwd: string[], input: string[], args: string[], isEs: boolean, ctx?: PermCtx): { lines: string[]; error?: string } {
+  const script = stripQuotes(args[0] ?? "");
+  const files = args.slice(1);
+  const match = script.match(/^(\d+)d$/);
+  if (!match) return { lines: [], error: `sed: ${isEs ? "solo se admite s/antiguo/nuevo/[g] y Nd" : "only s/old/new/[g] and Nd are supported"}` };
+  const addr = Number(match[1]);
+  let source: string[] | null = null;
+  if (files.length > 0) {
+    source = [];
+    for (const f of files) {
+      const res = readTextFile(state, cwd, f, "sed", isEs, ctx);
+      if (res.error) return { lines: [], error: res.error };
+      source.push(...contentLines(res.value ?? ""));
+    }
+  }
+  const rows = source ?? input;
+  return { lines: rows.filter((_l, idx) => idx + 1 !== addr) };
+}
+
+function awkEval(state: FsState, cwd: string[], input: string[], args: string[], isEs: boolean, ctx?: PermCtx): { lines: string[]; error?: string } {
+  let sep = "";
+  const progParts: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "-F") {
+      sep = args[i + 1] ?? "";
+      i++;
+      continue;
+    }
+    if (a.startsWith("-F") && a.length > 2) {
+      sep = a.slice(2);
+      continue;
+    }
+    progParts.push(a);
+  }
+  const prog = stripQuotes(progParts[0] ?? "");
+  const files = progParts.slice(1);
+  const blockMatch = prog.match(/^(?:\/([^/]+)\/)?\s*\{(.*)\}$/);
+  if (!blockMatch) return { lines: [], error: `awk: ${isEs ? "programa no válido" : "invalid program"}` };
+  const pattern = blockMatch[1];
+  const body = blockMatch[2].trim();
+  if (body.length > 0 && !body.startsWith("print")) {
+    return { lines: [], error: `awk: ${isEs ? "solo se admite print" : "only print is supported"}` };
+  }
+  let source: string[] | null = null;
+  if (files.length > 0) {
+    source = [];
+    for (const f of files) {
+      const res = readTextFile(state, cwd, f, "awk", isEs, ctx);
+      if (res.error) return { lines: [], error: res.error };
+      source.push(...contentLines(res.value ?? ""));
+    }
+  }
+  const rows = source ?? input;
+  const splitFields = (l: string): string[] => {
+    if (sep.length > 0) return l.split(sep);
+    return l.trim().split(/\s+/);
+  };
+  const out: string[] = [];
+  rows.forEach((l, idx) => {
+    const fields = splitFields(l);
+    if (pattern && !l.includes(pattern)) return;
+    if (body === "print" || body.length === 0) {
+      out.push(l);
+      return;
+    }
+    const printRest = body.replace(/^print\s*/, "");
+    const parts = printRest.split(",").map((p) => p.trim()).filter((p) => p.length > 0);
+    const values = parts.map((p) => {
+      if (p === "$0") return l;
+      if (p === "$NF") return fields[fields.length - 1] ?? "";
+      if (p === "NF") return String(fields.length);
+      if (p === "NR") return String(idx + 1);
+      const fm = p.match(/^\$(\d+)$/);
+      if (fm) return fields[Number(fm[1]) - 1] ?? "";
+      const qm = p.match(/^"([^"]*)"$/);
+      if (qm) return qm[1];
+      return p;
+    });
+    out.push(values.join(" "));
+  });
+  return { lines: out };
+}
+
+function cutEval(state: FsState, cwd: string[], input: string[], args: string[], isEs: boolean, ctx?: PermCtx): { lines: string[]; error?: string } {
+  let sep = "\t";
+  let fields: number[] = [];
+  const addSpec = (spec: string): string | null => {
+    for (const part of spec.split(",")) {
+      const range = part.match(/^(\d+)(?:-(\d*))?$/);
+      if (!range) return `cut: ${isEs ? "lista de campos no válida" : "invalid field list"}`;
+      const from = Number(range[1]);
+      if (range[2] === undefined) fields.push(from);
+      else if (range[2] === "") {
+        for (let n = from; n <= 100; n++) fields.push(n);
+      } else {
+        for (let n = from; n <= Number(range[2]); n++) fields.push(n);
+      }
+    }
+    return null;
+  };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "-d") sep = stripQuotes(args[i + 1] ?? "\t");
+    else if (a.startsWith("-d") && a.length > 2) sep = stripQuotes(a.slice(2));
+    else if (a === "-f") {
+      const specErr = addSpec(args[i + 1] ?? "");
+      if (specErr) return { lines: [], error: specErr };
+    } else if (a.startsWith("-f") && a.length > 2) {
+      const specErr = addSpec(a.slice(2));
+      if (specErr) return { lines: [], error: specErr };
+    }
+  }
+  if (fields.length === 0) return { lines: [], error: `cut: ${isEs ? "falta -f" : "missing -f"}` };
+  const files = args.filter((a, i) => !a.startsWith("-") && args[i - 1] !== "-d" && args[i - 1] !== "-f");
+  let source: string[] | null = null;
+  if (files.length > 0) {
+    source = [];
+    for (const f of files) {
+      const res = readTextFile(state, cwd, f, "cut", isEs, ctx);
+      if (res.error) return { lines: [], error: res.error };
+      source.push(...contentLines(res.value ?? ""));
+    }
+  }
+  const rows = source ?? input;
+  return { lines: rows.map((l) => {
+    const parts = l.split(sep);
+    return fields.map((n) => parts[n - 1] ?? "").join(sep);
+  }) };
+}
+
+function trEval(input: string[], args: string[], isEs: boolean): { lines: string[]; error?: string } {
+  const delF = args.some((a) => /^-d+$/.test(a));
+  const squeezeF = args.some((a) => /^-s+$/.test(a));
+  const sets = args.filter((a) => !a.startsWith("-")).map(stripQuotes);
+  if (delF) {
+    const set1 = sets[0];
+    if (!set1) return { lines: [], error: `tr: ${isEs ? "falta el conjunto" : "missing set"}` };
+    return { lines: input.map((l) => [...l].filter((c) => !set1.includes(c)).join("")) };
+  }
+  if (sets.length < 2) return { lines: [], error: `tr: ${isEs ? "se necesitan dos conjuntos" : "two sets required"}` };
+  const [from, to] = sets;
+  const expandSet = (s: string): string[] => {
+    const out: string[] = [];
+    for (let i = 0; i < s.length; i++) {
+      if (s[i + 1] === "-" && s[i + 2] !== undefined) {
+        for (let c = s.charCodeAt(i); c <= s.charCodeAt(i + 2); c++) out.push(String.fromCharCode(c));
+        i += 2;
+      } else out.push(s[i]);
+    }
+    return out;
+  };
+  const fromArr = expandSet(from);
+  const toArr = expandSet(to);
+  const map = new Map<string, string>();
+  fromArr.forEach((c, i) => map.set(c, toArr[i] ?? toArr[toArr.length - 1] ?? c));
+  const lines = input.map((l) => [...l].map((c) => map.get(c) ?? c).join(""));
+  if (!squeezeF) return { lines };
+  const squeezed = lines.map((l) => {
+    let out = "";
+    let last = "";
+    for (const c of l) {
+      if (c === last && toArr.includes(c)) continue;
+      out += c;
+      last = c;
+    }
+    return out;
+  });
+  return { lines: squeezed };
+}
+
+function diffEval(state: FsState, cwd: string[], args: string[], isEs: boolean, ctx?: PermCtx): { lines: string[]; error?: boolean } {
+  if (args.length < 2) {
+    return { lines: [isEs ? "uso: diff ARCHIVO1 ARCHIVO2" : "usage: diff FILE1 FILE2"], error: true };
+  }
+  const res1 = readTextFile(state, cwd, args[0], "diff", isEs, ctx);
+  const res2 = readTextFile(state, cwd, args[1], "diff", isEs, ctx);
+  if (res1.error) return { lines: [res1.error], error: true };
+  if (res2.error) return { lines: [res2.error], error: true };
+  const a = contentLines(res1.value ?? "");
+  const b = contentLines(res2.value ?? "");
+  const out: string[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length || j < b.length) {
+    if (i < a.length && j < b.length && a[i] === b[j]) {
+      i++;
+      j++;
+      continue;
+    }
+    if (j >= b.length) {
+      out.push(`${i + 1}d${j}`);
+      out.push(...a.slice(i).map((l) => `< ${l}`));
+      return { lines: out, error: true };
+    }
+    if (i >= a.length) {
+      out.push(`${i}a${j + 1}`);
+      out.push(...b.slice(j).map((l) => `> ${l}`));
+      return { lines: out, error: true };
+    }
+    let found = -1;
+    let mode: "d" | "a" = "d";
+    for (let k = 1; k <= 60 && i + k <= a.length; k++) {
+      if (i + k < a.length && a[i + k] === (b[j] ?? "\u0000sentinel")) {
+        found = k;
+        mode = "d";
+        break;
+      }
+    }
+    if (found === -1) {
+      for (let k = 1; k <= 60 && j + k <= b.length; k++) {
+        if (j + k < b.length && a[i] === b[j + k]) {
+          found = k;
+          mode = "a";
+          break;
+        }
+      }
+    }
+    if (found === -1) {
+      const aRem = a.slice(i);
+      const bRem = b.slice(j);
+      out.push(`${i + 1}c${j + 1}`);
+      out.push(...aRem.map((l) => `< ${l}`));
+      out.push("---");
+      out.push(...bRem.map((l) => `> ${l}`));
+      return { lines: out, error: true };
+    }
+    if (mode === "d") {
+      out.push(`${i + 1}d${j}`);
+      out.push(...a.slice(i, i + found).map((l) => `< ${l}`));
+      i += found;
+    } else {
+      out.push(`${i}a${j + 1}`);
+      out.push(...b.slice(j, j + found).map((l) => `> ${l}`));
+      j += found;
+    }
+  }
+  return { lines: out, error: out.length > 0 };
 }
 
 function jqFormat(value: unknown): string[] {
@@ -442,7 +1063,15 @@ function jqEval(value: unknown, filter: string): { ok: true; value: unknown } | 
   return { ok: true, value: current };
 }
 
-function applyFilter(cmd: string[], stdin: string[], isEs: boolean): { lines: string[]; error?: string } {
+interface FilterResult {
+  lines: string[];
+  error?: string;
+  state?: FsState;
+  cwd?: string[];
+}
+
+function applyFilter(state: FsState, cwd: string[], opts: BashOptions, cmd: string[], stdin: string[], isEs: boolean): FilterResult {
+  const ctx = ctxFromOpts(opts);
   const cmdName = cmd[0];
   const flags = cmd.slice(1).filter((a) => a.startsWith("-") && a.length > 1).flatMap((a) => a.slice(1).split(""));
   const rest = cmd.slice(1).filter((a) => !(a.startsWith("-") && a.length > 1));
@@ -471,15 +1100,59 @@ function applyFilter(cmd: string[], stdin: string[], isEs: boolean): { lines: st
     return { lines: [`${stdin.length} ${stdin.length} ${stdin.join(" ").length}`] };
   }
   if (cmdName === "sort") {
-    const sorted = [...stdin].sort();
-    return { lines: flags.includes("r") ? sorted.reverse() : sorted };
+    const keyIdx = cmd.indexOf("-k");
+    const keyField = keyIdx >= 0 ? Number(cmd[keyIdx + 1]) || 1 : flags.includes("k") ? 1 : 0;
+    const keyOf = (l: string): string => (keyField > 0 ? l.trim().split(/\s+/)[keyField - 1] ?? "" : l);
+    let sorted = [...stdin];
+    if (flags.includes("n")) {
+      sorted.sort((x, y) => {
+        const nx = Number(keyOf(x).replace(/^[^\d-]*/, ""));
+        const ny = Number(keyOf(y).replace(/^[^\d-]*/, ""));
+        return (Number.isFinite(nx) ? nx : Infinity) - (Number.isFinite(ny) ? ny : Infinity);
+      });
+    } else {
+      sorted.sort((x, y) => keyOf(x).localeCompare(keyOf(y)));
+    }
+    if (flags.includes("r")) sorted.reverse();
+    return { lines: sorted };
   }
   if (cmdName === "uniq") {
+    const countF = flags.includes("c");
     const out: string[] = [];
     for (const l of stdin) {
-      if (out.length === 0 || out[out.length - 1] !== l) out.push(l);
+      if (out.length === 0 || out[out.length - 1].replace(/^\s*\d+\s/, "") !== l) {
+        out.push(countF ? `${String(1).padStart(7)} ${l}` : l);
+      } else if (countF) {
+        const n = Number(out[out.length - 1].trim().split(/\s+/)[0]) + 1;
+        out[out.length - 1] = `${String(n).padStart(7)} ${l}`;
+      }
     }
     return { lines: out };
+  }
+  if (cmdName === "sed") {
+    const sedArgs = cmd.slice(1).map(stripQuotes);
+    if (sedArgs.some((a) => /^\d+d$/.test(a))) return sedDelete(state, cwd, stdin, sedArgs, isEs, ctx);
+    return sedEval(state, cwd, stdin, sedArgs, isEs, ctx);
+  }
+  if (cmdName === "awk") return awkEval(state, cwd, stdin, cmd.slice(1), isEs, ctx);
+  if (cmdName === "cut") return cutEval(state, cwd, stdin, cmd.slice(1), isEs, ctx);
+  if (cmdName === "tr") return trEval(stdin, cmd.slice(1), isEs);
+  if (cmdName === "tee") {
+    const appendF = flags.includes("a");
+    let st = state;
+    for (const f of rest) {
+      const res = writeFile(st, resolvePath(cwd, f).value, stdin.join("\n") + "\n", appendF);
+      if (!res.ok) return { lines: stdin, error: `tee: ${f}: ${isEs ? "No se puede escribir" : "cannot write"}` };
+      st = res.value;
+    }
+    return { lines: stdin, state: st };
+  }
+  if (cmdName === "xargs") {
+    const words = stdin.flatMap((l) => l.split(/\s+/)).filter((w) => w.length > 0);
+    const target = rest.join(" ");
+    if (!target) return { lines: [], error: isEs ? "xargs: falta el comando" : "xargs: missing command" };
+    const res = executeLine(state, cwd, [target, ...words].join(" "), { ...opts, piped: false });
+    return { lines: res.lines, error: res.error ? (res.lines[0] ?? "xargs: error") : undefined, state: res.state, cwd: res.cwd };
   }
   if (cmdName === "jq") {
     const filter = rest[0] ?? ".";
@@ -524,21 +1197,122 @@ function duLines(node: FsNode, path: string[], human: boolean): { lines: string[
   return { lines, bytes };
 }
 
+function scriptEnvAfter(snapshot: Record<string, string>, status: number): Record<string, string> {
+  const cleaned: Record<string, string> = {};
+  for (const [k, v] of Object.entries(snapshot)) {
+    if (k === "?" || k.startsWith("FN.") || k.startsWith("__")) continue;
+    cleaned[k] = v;
+  }
+  cleaned["?"] = status === 0 ? "0" : "1";
+  return cleaned;
+}
+
+function scriptOutcomeToResult(outcome: ReturnType<typeof runScript>): BashResult {
+  const result: BashResult = {
+    lines: outcome.lines,
+    state: outcome.state,
+    cwd: outcome.cwd,
+    clear: false,
+    exit: false,
+  };
+  if (outcome.error) result.error = true;
+  if (outcome.errFrom >= 0) result.errFrom = outcome.errFrom;
+  if (outcome.pending) result.pending = outcome.pending;
+  return { ...result, env: outcome.env };
+}
+
+function detectScript(state: FsState, cwd: string[], cmd: string, args: string[], isEs: boolean): { path: string[]; source: string; direct: boolean; needsX: boolean; error?: string } {
+  const isInterpreter = cmd === "bash" || cmd === "sh";
+  const direct = !isInterpreter;
+  const raw = direct ? cmd : args[0] ?? "";
+  if (!raw) return { path: [], source: "", direct, needsX: direct, error: isEs ? "falta el nombre del script" : "missing script name" };
+  const path = resolvePath(cwd, raw).value;
+  const node = getNode(state, path);
+  if (!node || node.kind !== "file") {
+    return { path, source: "", direct, needsX: direct, error: `${cmd}: ${raw}: No existe el archivo o el directorio` };
+  }
+  const source = node.content ?? "";
+  return { path, source, direct, needsX: direct };
+}
+
 export function executeLine(state: FsState, cwd: string[], rawLine: string, opts: BashOptions): BashResult {
+  if (opts.pending?.source) {
+    const outcome = runScript(state, cwd, opts.pending.source, { ...opts, pending: undefined }, executeLine, {
+      line: opts.pending.line,
+      variable: opts.pending.variable,
+      value: rawLine,
+    });
+    return scriptOutcomeToResult(outcome);
+  }
+  const sub = substituteCmds(rawLine, state, cwd, opts);
+  if (sub.error) return err(state, cwd, [sub.error], opts.isEs, "invalidPath");
+  const chain = parseChain(sub.line);
+  if (chain) {
+    let st = state;
+    let cw = cwd;
+    let lastOk = true;
+    let errFrom = -1;
+    const linesOut: string[] = [];
+    let clear = false;
+    let exit = false;
+    let envOut: Record<string, string> | undefined;
+    let broadcast: string | undefined;
+    let openRemote: BashResult["openRemote"];
+    for (const seg of chain) {
+      if (seg.op === "&&" && !lastOk) continue;
+      if (seg.op === "||" && lastOk) continue;
+      if (seg.line.length === 0) continue;
+      const res = executeSegment(st, cw, seg.line, opts);
+      if (res.env) envOut = res.env;
+      st = res.state;
+      cw = res.cwd;
+      lastOk = !res.error;
+      if (res.error && errFrom === -1) errFrom = linesOut.length;
+      linesOut.push(...res.lines);
+      if (res.clear) clear = true;
+      if (res.broadcast) broadcast = res.broadcast;
+      if (res.openRemote) openRemote = res.openRemote;
+      if (res.exit) {
+        exit = true;
+        break;
+      }
+      if (res.clear) break;
+    }
+    const base: BashResult = { lines: linesOut, state: st, cwd: cw, clear, exit };
+    if (errFrom >= 0) base.errFrom = errFrom;
+    else if (!lastOk) base.error = true;
+    if (envOut) base.env = envOut;
+    if (broadcast) base.broadcast = broadcast;
+    if (openRemote) base.openRemote = openRemote;
+    return base;
+  }
+  return executeSegment(state, cwd, sub.line, opts);
+}
+
+function executeSegment(state: FsState, cwd: string[], rawLine: string, opts: BashOptions): BashResult {
+  const isEs = opts.isEs;
+  const env: Record<string, string> = { ...(opts.env ?? {}) };
+  const ctx = ctxFromOpts(opts);
   const redir = redirectAtEnd(rawLine);
   if (redir) {
     const mainLine = rawLine.slice(0, rawLine.length - redir[0].length).trim();
     const inner = executeLine(state, cwd, mainLine, opts);
     if (inner.error) return inner;
     const target = resolvePath(cwd, redir[2]).value;
-    const res = writeFile(inner.state, target, inner.lines.join("\n") + "\n", redir[1] === ">>");
-    if (!res.ok) return err(inner.state, cwd, [], opts.isEs, res.error);
+    const targetNode = getNode(inner.state, target);
+    if (targetNode) {
+      if (!canPerm(targetNode, ctx, "w")) return err(inner.state, cwd, [], isEs, "denied");
+    } else {
+      const parent = getNode(inner.state, target.slice(0, -1));
+      if (parent && !canPerm(parent, ctx, "w")) return err(inner.state, cwd, [], isEs, "denied");
+    }
+    const res = writeFile(inner.state, target, inner.lines.join("\n") + "\n", redir[1] === ">>", ctx);
+    if (!res.ok) return err(inner.state, cwd, [], isEs, res.error);
     return { lines: [], state: res.value, cwd, clear: false, exit: false, env: inner.env };
   }
-  const isEs = opts.isEs;
-  const env: Record<string, string> = { ...(opts.env ?? {}) };
   const line = expandVars(rawLine, env);
-  const tokens = tokenize(line);
+  const qtokens = tokenizeQ(line);
+  const tokens = mergeTokens(qtokens, globExpand(state, cwd, qtokens.filter((t) => !t.quoted).map((t) => t.text)));
   if (tokens.length === 0) return ok(state, cwd, []);
   const cmd = tokens[0];
   const args = tokens.slice(1);
@@ -551,13 +1325,72 @@ export function executeLine(state: FsState, cwd: string[], rawLine: string, opts
     }
   }
 
+  const assignMatch = cmd.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+  if (assignMatch) {
+    env[assignMatch[1]] = stripQuotes(assignMatch[2]);
+    return { lines: [], state, cwd, clear: false, exit: false, env };
+  }
+
   if (cmd === "sudo") {
     if (args.length === 0) {
       return { lines: [isEs ? "uso: sudo <comando>" : "usage: sudo <command>"], state, cwd, clear: false, exit: false, error: true };
     }
-    const pwLine = isEs ? "[sudo] contraseña de alumno: (simulada, aceptada)" : "[sudo] password for alumno: (simulated, accepted)";
-    const inner = executeLine(state, cwd, args.join(" "), { ...opts, env });
+    const user = env.USER ?? "alumno";
+    const sudoersRes = readFile(state, ["etc", "sudoers"]);
+    const sudoers = sudoersRes.ok ? sudoersRes.value : "";
+    const allowed = user === "root" || sudoers.split("\n").some((l) => {
+      const clean = l.trim();
+      return clean.startsWith(`${user} ALL=`) || clean.startsWith(`%${user} `) || clean === `%${user}`;
+    });
+    if (!allowed) {
+      return { lines: [`${isEs ? `[sudo] contraseña de ${user}: (simulada, aceptada)` : `[sudo] password for ${user}: (simulated, accepted)`}`, isEs ? `sudo: el usuario ${user} no está en el archivo sudoers. Este incidente será informado.` : `sudo: user ${user} is not in the sudoers file. This incident will be reported.`], state, cwd, clear: false, exit: false, error: true };
+    }
+    const pwLine = isEs ? `[sudo] contraseña de ${user}: (simulada, aceptada)` : `[sudo] password for ${user}: (simulated, accepted)`;
+    const inner = executeLine(state, cwd, args.join(" "), { ...opts, env, asRoot: true });
     return { ...inner, lines: [pwLine, ...inner.lines] };
+  }
+
+  const isScript = cmd === "bash" || cmd === "sh" || (cmd.includes("/") && cmd.endsWith(".sh")) || (cmd.endsWith(".sh") && getNode(state, resolvePath(cwd, cmd).value) !== undefined);
+  if (isScript && !opts.piped) {
+    const det = detectScript(state, cwd, cmd, args, isEs);
+    if (det.error) {
+      return { lines: [det.error], state, cwd, clear: false, exit: false, error: true };
+    }
+    if (det.direct) {
+      const node = getNode(state, det.path);
+      if (node && !canPerm(node, ctx, "x")) {
+        return { lines: [`bash: ${cmd}: ${isEs ? "Permiso denegado" : "Permission denied"}`], state, cwd, clear: false, exit: false, error: true };
+      }
+    }
+    const scriptArgs = args.slice(1);
+    for (let i = 1; i < Math.min(scriptArgs.length + 1, 10); i++) {
+      env[`__A${i}`] = scriptArgs[i - 1] ?? "";
+    }
+    const pipeline = parsePipeline(line);
+    const outcome = runScript(state, cwd, det.source, { ...opts, env }, executeLine);
+    if (!outcome.pending) {
+      outcome.env = scriptEnvAfter(env, outcome.error ? 1 : 0);
+    }
+    if (pipeline && !outcome.pending) {
+      let stdinLines = outcome.lines;
+      let st = outcome.state;
+      let cwOut: string[] | null = null;
+      for (const filterSeg of pipeline.segments.slice(1)) {
+        if (filterSeg.length === 0) return err(state, cwd, [], isEs, "invalidPath");
+        const filtered = applyFilter(st, cwd, { ...opts, env: outcome.env }, filterSeg, stdinLines, isEs);
+        if (filtered.error) return { lines: [filtered.error], state, cwd, clear: false, exit: false, error: true };
+        stdinLines = filtered.lines;
+        if (filtered.state) st = filtered.state;
+        if (filtered.cwd) cwOut = filtered.cwd;
+      }
+      const pipeResult: BashResult = { lines: stdinLines, state: st, cwd: cwOut ?? outcome.cwd, clear: false, exit: false, env: outcome.env };
+      if (outcome.error) {
+        pipeResult.error = outcome.error;
+        if (outcome.errFrom >= 0) pipeResult.errFrom = outcome.errFrom;
+      }
+      return pipeResult;
+    }
+    return scriptOutcomeToResult(outcome);
   }
 
   const pipeline = parsePipeline(line);
@@ -568,13 +1401,19 @@ export function executeLine(state: FsState, cwd: string[], rawLine: string, opts
     const firstRes = executeLine(state, cwd, firstLine, { ...opts, env, piped: true });
     if (firstRes.error) return firstRes;
     let stdinLines = firstRes.lines;
+    let st = firstRes.state;
+    let cw: string[] | null = null;
     for (const filterSeg of pipeline.segments.slice(1)) {
       if (filterSeg.length === 0) return err(state, cwd, [], isEs, "invalidPath");
-      const filtered = applyFilter(filterSeg, stdinLines, isEs);
+      const filtered = applyFilter(st, cwd, { ...opts, env }, filterSeg, stdinLines, isEs);
       if (filtered.error) return { lines: [filtered.error], state, cwd, clear: false, exit: false, error: true };
       stdinLines = filtered.lines;
+      if (filtered.state) st = filtered.state;
+      if (filtered.cwd) cw = filtered.cwd;
     }
-    return { ...firstRes, lines: stdinLines, env };
+    const result: BashResult = { ...firstRes, lines: stdinLines, state: st, env };
+    if (cw) result.cwd = cw;
+    return result;
   }
 
   switch (cmd) {
@@ -587,7 +1426,8 @@ export function executeLine(state: FsState, cwd: string[], rawLine: string, opts
             "  ARCHIVOS  cat, touch, mkdir [-p], rm [-r], cp [-r], mv, ln [-s], find",
             "  VER       head/tail -n N, wc [-l], sort, uniq, less, stat, du [-h]",
             "  BUSCAR    grep [-i] [-v] [-n], which, whereis, find -name",
-            "  TEXTO     echo texto [> | >> archivo], cat, jq",
+            "  TEXTO     sed 's/a/b/g', awk '{print $1}', cut -d: -f1, tr, diff, echo texto [> | >> archivo], cat, jq",
+            "  TUBERÍAS  ls | grep txt, cat f | head, sort -n, uniq -c, tee archivo, xargs rm, && || ; $(comando)",
             "  ENTORNO   export VAR=valor, env, alias, history",
             "  PERMISOS  chmod 755 archivo, chmod +x script.sh",
             "  PAQUETES  apt install/update/list/search, tar -czf/-tzf/-xzf",
@@ -604,7 +1444,8 @@ export function executeLine(state: FsState, cwd: string[], rawLine: string, opts
             "  FILES     cat, touch, mkdir [-p], rm [-r], cp [-r], mv, ln [-s], find",
             "  VIEW      head/tail -n N, wc [-l], sort, uniq, less, stat, du [-h]",
             "  SEARCH    grep [-i] [-v] [-n], which, whereis, find -name",
-            "  TEXT      echo text [> | >> file], cat, jq",
+            "  TEXT      sed 's/a/b/g', awk '{print $1}', cut -d: -f1, tr, diff, echo text [> | >> file], cat, jq",
+            "  PIPES     ls | grep txt, cat f | head, sort -n, uniq -c, tee file, xargs rm, && || ; $(command)",
             "  ENV       export VAR=value, env, alias, history",
             "  PERMS     chmod 755 file, chmod +x script.sh",
             "  PACKAGES  apt install/update/list/search, tar -czf/-tzf/-xzf",
@@ -621,7 +1462,22 @@ export function executeLine(state: FsState, cwd: string[], rawLine: string, opts
       return ok(state, cwd, [], true);
 
     case "exit":
+    case "exit": {
+      const prevUser = env.SU_PREV_USER;
+      if (prevUser) {
+        const restored: Record<string, string> = {};
+        for (const [k, v] of Object.entries(env)) {
+          if (k === "SU_PREV_USER" || k === "SU_PREV_HOME") continue;
+          restored[k] = v;
+        }
+        restored.USER = prevUser;
+        restored.HOME = env.SU_PREV_HOME ?? `/home/${prevUser}`;
+        restored.LOGNAME = prevUser;
+        const homePath = restored.HOME.replace(/^\//, "").split("/");
+        return { lines: [], state, cwd: homePath, clear: false, exit: false, env: restored };
+      }
       return ok(state, cwd, [isEs ? "Sesión cerrada." : "Session closed."], false, true);
+    }
 
     case "pwd":
       return ok(state, cwd, [pathToString(cwd)]);
@@ -642,16 +1498,21 @@ export function executeLine(state: FsState, cwd: string[], rawLine: string, opts
       if (node.kind !== "dir") {
         return { lines: [`bash: cd: ${args[0]}: ${isEs ? "No es un directorio" : "Not a directory"}`], state, cwd, clear: false, exit: false, error: true };
       }
+      if (!canPerm(node, ctx, "x")) {
+        return { lines: [`bash: cd: ${args[0]}: ${isEs ? "Permiso denegado" : "Permission denied"}`], state, cwd, clear: false, exit: false, error: true };
+      }
       return ok(state, target.value, []);
     }
 
     case "ls":
-      return lsLines(state, cwd, args, isEs, opts.piped === true);
+      return lsLines(state, cwd, args, isEs, opts.piped === true, ctx);
 
     case "cat": {
       if (args.length === 0) return err(state, cwd, [], isEs, "invalidPath");
       const lines: string[] = [];
       for (const a of args) {
+        const denied = permDenied(state, cwd, a, ctx, "r", "cat", isEs);
+        if (denied) return { lines: [denied], state, cwd, clear: false, exit: false, error: true };
         const res = readFile(state, resolvePath(cwd, a).value);
         if (!res.ok) {
           return { lines: [`cat: ${a}: ${isEs ? "No existe el archivo o el directorio" : "No such file or directory"}`], state, cwd, clear: false, exit: false, error: true };
@@ -664,6 +1525,8 @@ export function executeLine(state: FsState, cwd: string[], rawLine: string, opts
     case "less":
     case "more": {
       if (args.length === 0) return err(state, cwd, [], isEs, "invalidPath");
+      const denied = permDenied(state, cwd, args[0], ctx, "r", cmd, isEs);
+      if (denied) return { lines: [denied], state, cwd, clear: false, exit: false, error: true };
       const res = readFile(state, resolvePath(cwd, args[0]).value);
       if (!res.ok) {
         return { lines: [`${cmd}: ${args[0]}: ${isEs ? "No existe el archivo o el directorio" : "No such file or directory"}`], state, cwd, clear: false, exit: false, error: true };
@@ -681,8 +1544,18 @@ export function executeLine(state: FsState, cwd: string[], rawLine: string, opts
       if (args.length === 0) return err(state, cwd, [], isEs, "invalidPath");
       let st = state;
       for (const a of args) {
-        if (getNodeRaw(st, resolvePath(cwd, a).value)) continue;
-        const res = writeFile(st, resolvePath(cwd, a).value, "");
+        const target = resolvePath(cwd, a).value;
+        const existingNode = getNodeRaw(st, target);
+        if (existingNode) {
+          const denied = permDenied(st, cwd, a, ctx, "w", "touch", isEs);
+          if (denied) return { lines: [denied], state: st, cwd, clear: false, exit: false, error: true };
+          continue;
+        }
+        const parent = getNode(st, target.slice(0, -1));
+        if (parent && !canPerm(parent, ctx, "w")) {
+          return { lines: [`touch: no se puede tocar '${a}': ${isEs ? "Permiso denegado" : "Permission denied"}`], state: st, cwd, clear: false, exit: false, error: true };
+        }
+        const res = writeFile(st, target, "", false, ctx);
         if (!res.ok) return err(st, cwd, [], isEs, res.error);
         st = res.value;
       }
@@ -696,7 +1569,9 @@ export function executeLine(state: FsState, cwd: string[], rawLine: string, opts
       let st = state;
       for (const d of dirs) {
         const target = resolvePath(cwd, d).value;
-        const res = pFlag ? mkdirP(st, target) : mkdir(st, target);
+        const denied = parentWriteDenied(st, cwd, d, ctx, "mkdir", isEs);
+        if (denied) return { lines: [denied], state: st, cwd, clear: false, exit: false, error: true };
+        const res = pFlag ? mkdirP(st, target, ctx) : mkdir(st, target, ctx);
         if (!res.ok) return err(st, cwd, [], isEs, res.error);
         st = res.value;
       }
@@ -707,6 +1582,8 @@ export function executeLine(state: FsState, cwd: string[], rawLine: string, opts
       if (args.length === 0) return err(state, cwd, [], isEs, "invalidPath");
       let st = state;
       for (const a of args) {
+        const denied = parentWriteDenied(st, cwd, a, ctx, "rm", isEs);
+        if (denied) return { lines: [denied], state: st, cwd, clear: false, exit: false, error: true };
         const res = deletePath(st, resolvePath(cwd, a).value, false);
         if (!res.ok) return err(st, cwd, [], isEs, res.error);
         st = res.value;
@@ -735,6 +1612,8 @@ export function executeLine(state: FsState, cwd: string[], rawLine: string, opts
           return { lines: [`rm: ${isEs ? "no se puede borrar" : "cannot remove"} '${rawTarget}': ${isEs ? "No existe el archivo o el directorio" : "No such file or directory"}`], state: st, cwd, clear: false, exit: false, error: true };
         }
         for (const name of matches) {
+          const denied = parentWriteDenied(st, cwd, rawTarget, ctx, "rm", isEs);
+          if (denied) return { lines: [denied], state: st, cwd, clear: false, exit: false, error: true };
           const res = deletePath(st, [...parentPath, name], recursive);
           if (!res.ok) return err(st, cwd, [], isEs, res.error);
           st = res.value;
@@ -750,12 +1629,18 @@ export function executeLine(state: FsState, cwd: string[], rawLine: string, opts
       const src = resolvePath(cwd, targets[0]).value;
       const srcNode = getNode(state, src);
       if (!srcNode) return err(state, cwd, [], isEs, "notFound");
+      const srcDenied = permDenied(state, cwd, targets[0], ctx, "r", "cp", isEs);
+      if (srcDenied) return { lines: [srcDenied], state, cwd, clear: false, exit: false, error: true };
       if (srcNode.kind === "dir" && !recursive) {
         return { lines: [`cp: -r no especificado; omitiendo el directorio '${targets[0]}'`], state, cwd, clear: false, exit: false, error: true };
       }
       const dstArg = resolvePath(cwd, targets[1]).value;
       const dstNode = getNode(state, dstArg);
       let st = state;
+      const dstDenied = dstNode && dstNode.kind === "dir"
+        ? permDenied(state, cwd, targets[1], ctx, "w", "cp", isEs)
+        : parentWriteDenied(state, cwd, targets[1], ctx, "cp", isEs);
+      if (dstDenied) return { lines: [dstDenied], state, cwd, clear: false, exit: false, error: true };
       if (dstNode && dstNode.kind === "dir" && dstNode.children?.[srcNode.name]) {
         const removed = deletePath(st, [...dstArg, srcNode.name], true);
         if (!removed.ok) return err(st, cwd, [], isEs, removed.error);
@@ -772,14 +1657,15 @@ export function executeLine(state: FsState, cwd: string[], rawLine: string, opts
       const src = resolvePath(cwd, args[0]).value;
       const srcNode = getNode(state, src);
       if (!srcNode) return err(state, cwd, [], isEs, "notFound");
+      const srcParentDenied = parentWriteDenied(state, cwd, args[0], ctx, "mv", isEs);
+      if (srcParentDenied) return { lines: [srcParentDenied], state, cwd, clear: false, exit: false, error: true };
       const dstArg = resolvePath(cwd, args[1]).value;
       const dstNode = getNode(state, dstArg);
       let st = state;
-      if (dstNode && dstNode.kind === "dir" && dstNode.children?.[srcNode.name]) {
-        const removed = deletePath(st, [...dstArg, srcNode.name], true);
-        if (!removed.ok) return err(st, cwd, [], isEs, removed.error);
-        st = removed.value;
-      }
+      const dstDenied = dstNode && dstNode.kind === "dir"
+        ? permDenied(state, cwd, args[1], ctx, "w", "mv", isEs)
+        : parentWriteDenied(state, cwd, args[1], ctx, "mv", isEs);
+      if (dstDenied) return { lines: [dstDenied], state, cwd, clear: false, exit: false, error: true };
       const dstPath = getNode(st, dstArg)?.kind === "dir" ? [...dstArg, srcNode.name] : dstArg;
       const res = movePath(st, src, dstPath);
       if (!res.ok) return err(st, cwd, [], isEs, res.error);
@@ -823,10 +1709,32 @@ export function executeLine(state: FsState, cwd: string[], rawLine: string, opts
         else rest.push(a);
       }
       const pattern = rest[0];
-      if (!pattern) return { lines: [isEs ? "uso: grep [-i] [-v] [-n] patrón [archivo...]" : "usage: grep [-i] [-v] [-n] pattern [file...]"], state, cwd, clear: false, exit: false, error: true };
+      if (!pattern) return { lines: [isEs ? "uso: grep [-i] [-v] [-n] [-r] patrón [archivo...]" : "usage: grep [-i] [-v] [-n] [-r] pattern [file...]"], state, cwd, clear: false, exit: false, error: true };
       const files = rest.slice(1);
       if (files.length === 0) return { lines: [isEs ? "grep: se necesita un archivo (o entra por una tubería)" : "grep: a file is required (or pipe input)"], state, cwd, clear: false, exit: false, error: true };
       const out: string[] = [];
+      if (flags.includes("r")) {
+        for (const dirRaw of files) {
+          const target = resolvePath(cwd, dirRaw).value;
+          const node = getNode(state, target);
+          if (!node) {
+            return { lines: [`grep: ${dirRaw}: ${isEs ? "No existe el archivo o el directorio" : "No such file or directory"}`], state, cwd, clear: false, exit: false, error: true };
+          }
+          const entries: { path: string; kind: string; content?: string }[] = [];
+          if (node.kind === "file") {
+            entries.push({ path: dirRaw, kind: "file", content: node.content ?? "" });
+          } else {
+            collectEntries(node, dirRaw, entries);
+          }
+          for (const entry of entries.filter((e) => e.kind === "file")) {
+            contentLines(entry.content ?? "").forEach((l) => {
+              const hit = flags.includes("i") ? l.toLowerCase().includes(pattern.toLowerCase()) : l.includes(pattern);
+              if (flags.includes("v") ? !hit : hit) out.push(`${entry.path}:${l}`);
+            });
+          }
+        }
+        return ok(state, cwd, out);
+      }
       for (const fileRaw of files) {
         const res = readFile(state, resolvePath(cwd, fileRaw).value);
         if (!res.ok) {
@@ -842,6 +1750,53 @@ export function executeLine(state: FsState, cwd: string[], rawLine: string, opts
         });
       }
       return ok(state, cwd, out);
+    }
+
+    case "printf": {
+      const text = stripQuotes(args.join(" "));
+      const decoded = text.replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\([\$"'\\])/g, "$1");
+      const rows = decoded.split("\n");
+      if (rows.length > 0 && rows[rows.length - 1] === "") rows.pop();
+      return ok(state, cwd, rows);
+    }
+
+    case "sed":
+    case "awk":
+    case "cut": {
+      if (args.length === 0) {
+        return { lines: [isEs ? `uso: ${cmd} 'programa' archivo` : `usage: ${cmd} 'program' file`], state, cwd, clear: false, exit: false, error: true };
+      }
+      if (!opts.piped && args.length < 2) {
+        return { lines: [isEs ? `${cmd}: se necesita un archivo (o entra por una tubería)` : `${cmd}: a file is required (or pipe input)`], state, cwd, clear: false, exit: false, error: true };
+      }
+      const cleanArgs = cmd === "sed" ? args.map(stripQuotes) : args;
+      const evalRes = cmd === "sed"
+        ? (cleanArgs.some((a) => /^\d+d$/.test(a)) ? sedDelete(state, cwd, [], cleanArgs, isEs, ctx) : sedEval(state, cwd, [], cleanArgs, isEs, ctx))
+        : cmd === "awk"
+          ? awkEval(state, cwd, [], args, isEs, ctx)
+          : cutEval(state, cwd, [], args, isEs, ctx);
+      if (evalRes.error) return { lines: [evalRes.error], state, cwd, clear: false, exit: false, error: true };
+      return ok(state, cwd, evalRes.lines);
+    }
+
+    case "tr":
+    case "tee":
+    case "xargs": {
+      if (!opts.piped) {
+        return { lines: [isEs ? `${cmd}: se usa con una tubería (ejemplo: cat file | ${cmd} ...)` : `${cmd}: needs a pipe (e.g. cat file | ${cmd} ...)`], state, cwd, clear: false, exit: false, error: true };
+      }
+      const filterRes: FilterResult = cmd === "tr"
+        ? trEval([], args, isEs)
+        : applyFilter(state, cwd, opts, tokens, [], isEs);
+      if (filterRes.error) return { lines: [filterRes.error], state, cwd, clear: false, exit: false, error: true };
+      return ok(filterRes.state ?? state, filterRes.cwd ?? cwd, filterRes.lines);
+    }
+
+    case "diff": {
+      const res = diffEval(state, cwd, args, isEs, ctx);
+      if (res.lines.length === 0 && !res.error) return ok(state, cwd, []);
+      const base = { lines: res.lines, state, cwd, clear: false, exit: false };
+      return res.error ? { ...base, error: true } : ok(state, cwd, res.lines);
     }
 
     case "head":
@@ -876,12 +1831,33 @@ export function executeLine(state: FsState, cwd: string[], rawLine: string, opts
       if (!res.ok) return err(state, cwd, [], isEs, res.error);
       let fileLines = contentLines(res.value);
       if (cmd === "sort") {
-        fileLines = [...fileLines].sort();
+        const keyIdx = args.indexOf("-k");
+        const keyField = keyIdx >= 0 ? Number(args[keyIdx + 1]) || 1 : args.some((a) => /^-k\d+$/.test(a)) ? Number(args.find((a) => /^-k\d+$/.test(a))!.slice(2)) || 1 : 0;
+        const keyOf = (l: string): string => (keyField > 0 ? l.trim().split(/\s+/)[keyField - 1] ?? "" : l);
+        if (args.some((a) => a === "-n" || (a.startsWith("-") && a.slice(1).includes("n")))) {
+          fileLines = [...fileLines].sort((x, y) => {
+            const nx = Number(keyOf(x).replace(/^[^\d-]*/, ""));
+            const ny = Number(keyOf(y).replace(/^[^\d-]*/, ""));
+            return (Number.isFinite(nx) ? nx : Infinity) - (Number.isFinite(ny) ? ny : Infinity);
+          });
+        } else {
+          fileLines = [...fileLines].sort((x, y) => keyOf(x).localeCompare(keyOf(y)));
+        }
         if (args.some((a) => a.startsWith("-") && a.slice(1).includes("r"))) fileLines.reverse();
       } else {
+        const countF = args.some((a) => a.startsWith("-") && a.slice(1).includes("c"));
         const out: string[] = [];
         for (const l of fileLines) {
-          if (out.length === 0 || out[out.length - 1] !== l) out.push(l);
+          if (out.length === 0) {
+            out.push(countF ? `${String(1).padStart(7)} ${l}` : l);
+            continue;
+          }
+          const lastLine = out[out.length - 1].replace(/^\s*\d+\s/, "");
+          if (lastLine !== l) out.push(countF ? `${String(1).padStart(7)} ${l}` : l);
+          else if (countF) {
+            const n = Number(out[out.length - 1].trim().split(/\s+/)[0]) + 1;
+            out[out.length - 1] = `${String(n).padStart(7)} ${l}`;
+          }
         }
         fileLines = out;
       }
@@ -918,6 +1894,10 @@ export function executeLine(state: FsState, cwd: string[], rawLine: string, opts
         const targetPath = resolvePath(cwd, t).value;
         const node = getNodeRaw(st, targetPath);
         if (!node) return err(st, cwd, [], isEs, "notFound");
+        const isOwner = !node.owner || node.owner === ctx.user;
+        if (!isOwner && !ctx.asRoot && ctx.user !== "root") {
+          return { lines: [`chmod: cambiando permisos de '${t}': ${isEs ? "Operación no permitida" : "Operation not permitted"}`], state: st, cwd, clear: false, exit: false, error: true };
+        }
         let newBody: string | null = null;
         if (/^[0-7]{3,4}$/.test(modeArg)) {
           newBody = permString(modeArg);
@@ -1150,13 +2130,13 @@ export function executeLine(state: FsState, cwd: string[], rawLine: string, opts
         return { lines: [isEs ? "uso: export VARIABLE=valor" : "usage: export VARIABLE=value"], state, cwd, clear: false, exit: false, error: true };
       }
       const name = joined.slice(0, eq).trim();
-      const value = stripQuotes(expandVars(joined.slice(eq + 1).trim(), env));
+      const value = stripQuotes(expandVars(joined.slice(eq + 1).replace(/^\s+/, ""), env));
       env[name] = value;
       return { lines: [], state, cwd, clear: false, exit: false, env };
     }
 
     case "env": {
-      const rows = Object.keys(env).filter((k) => !k.startsWith("ALIAS.")).sort().map((k) => `${k}=${env[k]}`);
+      const rows = Object.keys(env).filter((k) => !k.startsWith("ALIAS.") && !k.startsWith("FN.") && !k.startsWith("__")).sort().map((k) => `${k}=${env[k]}`);
       return ok(state, cwd, rows.length > 0 ? rows : [isEs ? "Sin variables definidas." : "No variables defined."]);
     }
 
@@ -1186,6 +2166,176 @@ export function executeLine(state: FsState, cwd: string[], rawLine: string, opts
 
     case "whoami":
       return ok(state, cwd, [opts.remote ? "invitado" : env.USER ?? "alumno"]);
+
+    case "[":
+    case "test": {
+      const inner = cmd === "[" ? args.slice(0, -1) : args;
+      if (cmd === "[" && args[args.length - 1] !== "]") {
+        return { lines: ["bash: [: falta `]`"], state, cwd, clear: false, exit: false, error: true };
+      }
+      const tokens = inner.map((t) => t.replace(/^["']|["']$/g, ""));
+      const passed = scriptTestEval(tokens.length > 0 ? tokens : [], state, cwd, env);
+      if (!passed) return { lines: [], state, cwd, clear: false, exit: false, error: true };
+      return ok(state, cwd, []);
+    }
+
+    case "id": {
+      const user = args[0] ?? env.USER ?? "alumno";
+      const passwdRes = readFile(state, ["etc", "passwd"]);
+      if (!passwdRes.ok) return ok(state, cwd, [`uid=1000(${user}) gid=1000(${user}) grupos=1000(${user})`]);
+      const row = passwdRes.value.split("\n").find((l) => l.startsWith(`${user}:`));
+      if (!row) {
+        return { lines: [`id: '${user}': no existe ese usuario`], state, cwd, clear: false, exit: false, error: true };
+      }
+      const parts = row.split(":");
+      const uid = parts[2] ?? "1000";
+      const gid = parts[3] ?? "1000";
+      const groupRes = readFile(state, ["etc", "group"]);
+      const groups = groupRes.ok
+        ? groupRes.value.split("\n").filter((l) => l.includes(`:${uid}`) || l.startsWith(`${user}:`)).map((l) => {
+            const seg = l.split(":");
+            return `${seg[2]}(${seg[0]})`;
+          })
+        : [];
+      const grupos = groups.length > 0 ? groups.join(",") : `${gid}(${user})`;
+      return ok(state, cwd, [`uid=${uid}(${user}) gid=${gid}(${user}) grupos=${grupos}`]);
+    }
+
+    case "useradd":
+    case "adduser": {
+      if (!ctx.asRoot && ctx.user !== "root") {
+        return { lines: [isEs ? `useradd: permiso denegado. Usa: sudo ${cmd} <usuario>` : `useradd: permission denied. Use: sudo ${cmd} <user>`], state, cwd, clear: false, exit: false, error: true };
+      }
+      const name = args[0];
+      if (!name || !/^[a-z_][a-z0-9_-]{0,30}$/i.test(name)) {
+        return { lines: [isEs ? "uso: useradd <usuario>" : "usage: useradd <user>"], state, cwd, clear: false, exit: false, error: true };
+      }
+      const passwdRes = readFile(state, ["etc", "passwd"]);
+      const rows = passwdRes.ok ? contentLines(passwdRes.value) : [];
+      if (rows.some((l) => l.startsWith(`${name}:`))) {
+        return { lines: [`useradd: el usuario '${name}' ya existe`], state, cwd, clear: false, exit: false, error: true };
+      }
+      const nextId = rows.reduce((max, l) => {
+        const seg = l.split(":");
+        const id = Number(seg[2]);
+        return Number.isFinite(id) && id >= 1000 && id > max ? id : max;
+      }, 1000) + 1;
+      const pwValue = passwdRes.ok ? passwdRes.value : "";
+      const newPasswd = `${pwValue}${name}:x:${nextId}:${nextId}::/home/${name}:/bin/bash\n`;
+      let st = writeFile(state, ["etc", "passwd"], newPasswd, false, { user: "root", asRoot: true });
+      if (!st.ok) return err(state, cwd, [], isEs, st.error);
+      const groupRes = readFile(st.value, ["etc", "group"]);
+      const newGroup = `${groupRes.ok ? groupRes.value : ""}${name}:x:${nextId}:\n`;
+      const st2 = writeFile(st.value, ["etc", "group"], newGroup, false, { user: "root", asRoot: true });
+      if (!st2.ok) return err(st.value, cwd, [], isEs, st2.error);
+      const st3 = mkdirP(st2.value, ["home", name], { user: "root", asRoot: true });
+      if (!st3.ok) return err(st2.value, cwd, [], isEs, st3.error);
+      const st4 = chownTree(st3.value, ["home", name], name, name, true);
+      if (!st4.ok || !st4.value) return err(st3.value, cwd, [], isEs, st4.ok ? "invalidPath" : st4.error);
+      return ok(st4.value, cwd, [isEs ? `Usuario '${name}' creado (uid ${nextId}) con carpeta en /home/${name}.` : `User '${name}' created (uid ${nextId}) with folder at /home/${name}.`]);
+    }
+
+    case "userdel": {
+      if (!ctx.asRoot && ctx.user !== "root") {
+        return { lines: [isEs ? "userdel: permiso denegado. Usa: sudo userdel <usuario>" : "userdel: permission denied. Use: sudo userdel <user>"], state, cwd, clear: false, exit: false, error: true };
+      }
+      const name = args.find((a) => !a.startsWith("-")) ?? "";
+      const passwdRes = readFile(state, ["etc", "passwd"]);
+      const rows = passwdRes.ok ? contentLines(passwdRes.value) : [];
+      if (!rows.some((l) => l.startsWith(`${name}:`))) {
+        return { lines: [`userdel: el usuario '${name}' no existe`], state, cwd, clear: false, exit: false, error: true };
+      }
+      const filtered = rows.filter((l) => !l.startsWith(`${name}:`)).join("\n") + "\n";
+      let st = writeFile(state, ["etc", "passwd"], filtered, false, { user: "root", asRoot: true });
+      if (!st.ok) return err(state, cwd, [], isEs, st.error);
+      const groupRes = readFile(st.value, ["etc", "group"]);
+      const gRows = groupRes.ok ? contentLines(groupRes.value) : [];
+      const newGroup = gRows.filter((l) => !l.startsWith(`${name}:`)).join("\n") + "\n";
+      const st2 = writeFile(st.value, ["etc", "group"], newGroup, false, { user: "root", asRoot: true });
+      if (!st2.ok) return err(st.value, cwd, [], isEs, st2.error);
+      const removeHome = args.some((a) => /^-/.test(a) && a.slice(1).includes("r"));
+      if (removeHome && getNode(st2.value, ["home", name])) {
+        const st3 = deletePath(st2.value, ["home", name], true);
+        if (!st3.ok) return err(st2.value, cwd, [], isEs, st3.error);
+        return ok(st3.value, cwd, [isEs ? `Usuario '${name}' eliminado (con /home/${name}).` : `User '${name}' deleted (with /home/${name}).`]);
+      }
+      return ok(st2.value, cwd, [isEs ? `Usuario '${name}' eliminado.` : `User '${name}' deleted.`]);
+    }
+
+    case "passwd": {
+      const user = args[0] ?? ctx.user;
+      if (user !== ctx.user && !ctx.asRoot && ctx.user !== "root") {
+        return { lines: [`passwd: Solo root puede cambiar la contraseña de otro usuario.`], state, cwd, clear: false, exit: false, error: true };
+      }
+      return ok(state, cwd, [isEs ? `Cambiando contraseña de ${user}. (simulado: se acepta cualquier cambio)` : `Changing password for ${user}. (simulated: any change is accepted)`]);
+    }
+
+    case "su": {
+      const targetRaw = args[0] === "-" || args[0] === "-l" ? args[1] : args[0];
+      const target = targetRaw ?? "root";
+      const passwdRes = readFile(state, ["etc", "passwd"]);
+      const rows = passwdRes.ok ? contentLines(passwdRes.value) : [];
+      const row = rows.find((l) => l.startsWith(`${target}:`));
+      if (!row) {
+        return { lines: [`su: fallo al ejecutar el usuario: ${isEs ? "No existe el archivo o el directorio" : "No such file or directory"}`], state, cwd, clear: false, exit: false, error: true };
+      }
+      const home = row.split(":")[5] ?? `/home/${target}`;
+      const homePath = home === "/" ? [] : home.replace(/^\//, "").split("/");
+      const suEnv = { ...env, USER: target, HOME: home, LOGNAME: target, SU_PREV_USER: env.USER ?? "alumno", SU_PREV_HOME: env.HOME ?? `/home/${env.USER ?? "alumno"}` };
+      return { lines: [], state, cwd: homePath, clear: false, exit: false, env: suEnv };
+    }
+
+    case "umask": {
+      const value = args[0];
+      if (!value) {
+        const current = env.UMASK ?? "022";
+        return ok(state, cwd, [`00${current}`.slice(-4)]);
+      }
+      if (!/^[0-7]{3,4}$/.test(value)) {
+        return { lines: [`umask: modo octal no válido: ${value}`], state, cwd, clear: false, exit: false, error: true };
+      }
+      return { lines: [], state, cwd, clear: false, exit: false, env: { ...env, UMASK: value } };
+    }
+
+    case "chown": {
+      const recursive = args.some((a) => /^-+[a-z]*r[a-z]*$/i.test(a) && a.slice(1).includes("R"));
+      const spec = args.find((a) => a.includes(":") || (!a.startsWith("-") && !a.includes("/")));
+      const targets = args.filter((a) => !a.startsWith("-") && a !== spec);
+      if (!spec || targets.length === 0) {
+        return { lines: [isEs ? "uso: chown [-R] usuario[:grupo] <archivo...>" : "usage: chown [-R] user[:group] <file...>"], state, cwd, clear: false, exit: false, error: true };
+      }
+      if (!ctx.asRoot && ctx.user !== "root") {
+        return { lines: [`chown: cambiando la propiedad de '${targets[0]}': ${isEs ? "Operación no permitida" : "Operation not permitted"}`], state, cwd, clear: false, exit: false, error: true };
+      }
+      const [owner, group] = spec.includes(":") ? [spec.slice(0, spec.indexOf(":")), spec.slice(spec.indexOf(":") + 1) || null] : [spec, null];
+      let st = state;
+      for (const t of targets) {
+        const res = chownTree(st, resolvePath(cwd, t).value, owner, group, recursive);
+        if (!res.ok) return err(st, cwd, [], isEs, res.error);
+        st = res.value ?? st;
+      }
+      return ok(st, cwd, []);
+    }
+
+    case "chgrp": {
+      const recursive = args.some((a) => a.startsWith("-") && a.slice(1).includes("R"));
+      const spec = args.find((a) => !a.startsWith("-") && !a.includes("/"));
+      const targets = args.filter((a) => !a.startsWith("-") && a !== spec);
+      if (!spec || targets.length === 0) {
+        return { lines: [isEs ? "uso: chgrp [-R] grupo <archivo...>" : "usage: chgrp [-R] group <file...>"], state, cwd, clear: false, exit: false, error: true };
+      }
+      const owned = getNodeRaw(state, resolvePath(cwd, targets[0]).value);
+      if (owned && owned.owner !== ctx.user && !ctx.asRoot && ctx.user !== "root") {
+        return { lines: [`chgrp: cambiando el grupo de '${targets[0]}': ${isEs ? "Operación no permitida" : "Operation not permitted"}`], state, cwd, clear: false, exit: false, error: true };
+      }
+      let st = state;
+      for (const t of targets) {
+        const res = chownTree(st, resolvePath(cwd, t).value, null, spec, recursive);
+        if (!res.ok) return err(st, cwd, [], isEs, res.error);
+        st = res.value ?? st;
+      }
+      return ok(st, cwd, []);
+    }
 
     case "hostname": {
       if (args.some((a) => a.toUpperCase().includes("I"))) return ok(state, cwd, ["192.168.1.42"]);

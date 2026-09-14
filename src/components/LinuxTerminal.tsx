@@ -51,6 +51,7 @@ interface Session {
   search: ReverseSearch | null;
   killRing: string;
   env: Record<string, string>;
+  pendingScript: { variable: string; resumeLine: number; source: string } | null;
   ended: boolean;
 }
 
@@ -377,7 +378,7 @@ export default function LinuxTerminal({ locale }: Props) {
 
   const [fs, setFs] = useState<FsState>(createInitialFs);
   const [sessions, setSessions] = useState<Session[]>(() => [
-    { id: 1, remote: null, fs: null, cwd: [...USER_HOME], entries: bannerLines(locale === "es").map((t) => ({ kind: "out" as const, text: t })), input: "", cursor: 0, histIdx: -1, saved: "", search: null, killRing: "", env: { ...DEFAULT_HOME_ENV }, ended: false },
+    { id: 1, remote: null, fs: null, cwd: [...USER_HOME], entries: bannerLines(locale === "es").map((t) => ({ kind: "out" as const, text: t })), input: "", cursor: 0, histIdx: -1, saved: "", search: null, killRing: "", pendingScript: null, env: { ...DEFAULT_HOME_ENV }, ended: false },
   ]);
   const [activeId, setActiveId] = useState(1);
   const [unread, setUnread] = useState<Record<number, number>>({});
@@ -484,7 +485,7 @@ export default function LinuxTerminal({ locale }: Props) {
 
   const applyEnv = useCallback((env: SavedEnv) => {
     setFs(env.fs);
-    const restored = env.sessions.map((s) => ({ ...s, input: "", cursor: 0, histIdx: -1, search: null, saved: "", killRing: "" }));
+    const restored = env.sessions.map((s) => ({ ...s, input: "", cursor: 0, histIdx: -1, search: null, saved: "", killRing: "", pendingScript: null }));
     setSessions(restored);
     setActiveId(restored.some((s) => s.id === env.activeId) ? env.activeId : restored[0].id);
     nextIdRef.current = Math.max(...restored.map((s) => s.id)) + 1;
@@ -598,7 +599,7 @@ export default function LinuxTerminal({ locale }: Props) {
     const id = nextIdRef.current++;
     setSessions((prev) => [
       ...prev,
-      { id, remote: null, fs: null, cwd: [...USER_HOME], entries: [{ kind: "out", text: "" }, { kind: "out", text: isEs ? "Nueva terminal local. Todas las locales comparten el mismo disco." : "New local terminal. All local tabs share the same disk." }], input: "", cursor: 0, histIdx: -1, saved: "", search: null, killRing: "", env: { ...DEFAULT_HOME_ENV }, ended: false },
+      { id, remote: null, fs: null, cwd: [...USER_HOME], entries: [{ kind: "out", text: "" }, { kind: "out", text: isEs ? "Nueva terminal local. Todas las locales comparten el mismo disco." : "New local terminal. All local tabs share the same disk." }], input: "", cursor: 0, histIdx: -1, saved: "", search: null, killRing: "", pendingScript: null, env: { ...DEFAULT_HOME_ENV }, ended: false },
     ]);
     setActiveId(id);
     setUnread((prev) => ({ ...prev, [id]: 0 }));
@@ -608,7 +609,7 @@ export default function LinuxTerminal({ locale }: Props) {
     setSessions((prev) => {
       const next = prev.filter((s) => s.id !== id);
       if (next.length === 0) {
-        const fresh: Session = { id: nextIdRef.current++, remote: null, fs: null, cwd: [...USER_HOME], entries: bannerLines(isEs).map((t) => ({ kind: "out" as const, text: t })), input: "", cursor: 0, histIdx: -1, saved: "", search: null, killRing: "", env: { ...DEFAULT_HOME_ENV }, ended: false };
+        const fresh: Session = { id: nextIdRef.current++, remote: null, fs: null, cwd: [...USER_HOME], entries: bannerLines(isEs).map((t) => ({ kind: "out" as const, text: t })), input: "", cursor: 0, histIdx: -1, saved: "", search: null, killRing: "", pendingScript: null, env: { ...DEFAULT_HOME_ENV }, ended: false };
         setActiveId(fresh.id);
         return [fresh];
       }
@@ -624,7 +625,7 @@ export default function LinuxTerminal({ locale }: Props) {
 
   const resetTerminal = useCallback(() => {
     setFs(createInitialFs());
-    setSessions([{ id: nextIdRef.current++, remote: null, fs: null, cwd: [...USER_HOME], entries: bannerLines(isEs).map((t) => ({ kind: "out" as const, text: t })), input: "", cursor: 0, histIdx: -1, saved: "", search: null, killRing: "", env: { ...DEFAULT_HOME_ENV }, ended: false }]);
+    setSessions([{ id: nextIdRef.current++, remote: null, fs: null, cwd: [...USER_HOME], entries: bannerLines(isEs).map((t) => ({ kind: "out" as const, text: t })), input: "", cursor: 0, histIdx: -1, saved: "", search: null, killRing: "", pendingScript: null, env: { ...DEFAULT_HOME_ENV }, ended: false }]);
     setActiveLesson(null);
     setShowHint(false);
     setUnread({});
@@ -654,26 +655,38 @@ export default function LinuxTerminal({ locale }: Props) {
     const env = session.env;
     const sessionFs = session.remote && session.fs ? session.fs : fs;
     patchSession(session.id, { input: "", cursor: 0, histIdx: -1, saved: "", search: null, killRing: "" });
-    if (!line.trim()) {
+    if (!line.trim() && !session.pendingScript) {
       appendEntries(session.id, [{ kind: "cmd", text: `${promptString(cwd, env)} ` }]);
       return;
     }
     appendEntries(session.id, [{ kind: "cmd", text: `${promptString(cwd, env)} ${line}` }]);
-    const nextHistory = [line, ...cmdHistory.filter((h) => h !== line)].slice(0, 60);
-    setCmdHistory(nextHistory);
-    persist(doneLessons, nextHistory);
+    if (line.trim()) {
+      const nextHistory = [line, ...cmdHistory.filter((h) => h !== line)].slice(0, 60);
+      setCmdHistory(nextHistory);
+      persist(doneLessons, nextHistory);
+    }
 
     const opts: BashOptions = { isEs, env, history: cmdHistory, remote: Boolean(session.remote) };
+    if (session.pendingScript) {
+      opts.pending = { line: session.pendingScript.resumeLine, variable: session.pendingScript.variable, value: line, source: session.pendingScript.source };
+    }
     const result = executeLine(sessionFs, cwd, line, opts);
 
     if (result.clear) {
-      patchSession(session.id, { cwd: result.cwd, env: result.env ?? env, fs: session.remote ? result.state : session.fs, entries: [] });
+      patchSession(session.id, { cwd: result.cwd, env: result.env ?? env, fs: session.remote ? result.state : session.fs, entries: [], pendingScript: null });
       if (!session.remote) setFs(result.state);
       if (result.exit) patchSession(session.id, { ended: true });
       return;
     }
-    appendEntries(session.id, result.lines.map((t) => ({ kind: (result.error ? "err" : "out") as OutputEntry["kind"], text: t })));
-    patchSession(session.id, { cwd: result.cwd, env: result.env ?? env, fs: session.remote ? result.state : session.fs });
+    if (result.errFrom !== undefined && result.errFrom > 0) {
+      appendEntries(session.id, [
+        ...result.lines.slice(0, result.errFrom).map((t) => ({ kind: "out" as const, text: t })),
+        ...result.lines.slice(result.errFrom).map((t) => ({ kind: "err" as const, text: t })),
+      ]);
+    } else {
+      appendEntries(session.id, result.lines.map((t) => ({ kind: (result.error ? "err" : "out") as OutputEntry["kind"], text: t })));
+    }
+    patchSession(session.id, { cwd: result.cwd, env: result.env ?? env, fs: session.remote ? result.state : session.fs, pendingScript: result.pending ?? null });
     if (!session.remote) setFs(result.state);
 
     if (result.exit) {
@@ -702,6 +715,7 @@ export default function LinuxTerminal({ locale }: Props) {
           saved: "",
           search: null,
           killRing: "",
+          pendingScript: null,
           env: remoteEnv,
           ended: false,
         },
